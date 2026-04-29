@@ -1,3 +1,7 @@
+---
+license: apache-2.0
+---
+
 # WikiVerse
 
 Multi-model embedding dataset built on [HuggingFace FineWiki](https://huggingface.co/datasets/HuggingFaceFW/finewiki), designed for approximate nearest neighbor (ANN) search benchmarking with [USearch](https://github.com/unum-cloud/usearch) and other vector search engines.
@@ -128,29 +132,69 @@ unum-cloud/WikiVerse/
 ├── e5-mistral-7b-instruct/                   # 4096-dim, decoder, float16 (planned)
 │   └── <wiki>/<group>_<shard>.{body,title}.f16bin
 │
-└── gte-moderncolbert-v1/                     #  128-dim per token, ColBERT (planned)
+└── gte-moderncolbert-v1/                     # 128-dim per token, ColBERT (planned)
     └── <wiki>/<group>_<shard>.{body,title}.f16bin
 ```
 
-Binary embedding files are tracked via [Git LFS](https://git-lfs.com).
-To clone the repo without downloading the binaries (~600 GB):
+## Downloading
+
+WikiVerse lives on three coordinated mirrors, all sharing the same single-branch Git history:
+
+| Mirror              | Holds                          | Best for                         |
+| :------------------ | :----------------------------- | :------------------------------- |
+| HuggingFace Hub     | code + LFS bytes (canonical)   | `git clone`, `hf` CLI, streaming |
+| GitHub              | code + LFS pointers (no bytes) | reading the code, contributing   |
+| Nebius S3           | flat byte mirror of LFS blobs  | bulk downloads, batch jobs       |
+
+`.f16bin` files are tracked via [Git LFS](https://git-lfs.com); on GitHub, the LFS server is rerouted to HuggingFace, so GitHub clones receive only ~200-byte pointer files.
+
+### From HuggingFace
+
+The default and the simplest path — full code, full data, single command:
 
 ```sh
-GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/unum-cloud/WikiVerse
+git clone https://huggingface.co/datasets/ashvardanian/WikiVerse
 ```
 
-Load embeddings for a single language (Python):
+To skip the ~600 GB of binaries and get only code + pointers:
+
+```sh
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/ashvardanian/WikiVerse
+```
+
+### From GitHub
+
+The GitHub repo holds only code and LFS pointers; the actual binaries live on HuggingFace. After cloning, point Git LFS at HuggingFace and pull:
+
+```sh
+git clone https://github.com/ashvardanian/WikiVerse
+cd WikiVerse
+git config lfs.url https://huggingface.co/datasets/ashvardanian/WikiVerse.git/info/lfs
+git lfs pull
+```
+
+### From Nebius S3
+
+The fastest path for bulk downloads — pulls byte-identical LFS objects directly from object storage, then materializes the `.f16bin` files into the working tree:
+
+```sh
+aws s3 sync s3://wikiverse/lfs/ ./.git/lfs/objects/ \
+    --endpoint-url https://storage.us-central1.nebius.cloud
+git lfs checkout
+```
+
+### Loading embeddings in Python
 
 ```python
 from wikiverse import read_bin
-mat = read_bin("qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin", dtype="f16")
-# mat.shape == (n_articles_in_shard, 1024)
+matrix = read_bin("qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin", dtype="f16")
+# matrix.shape == (rows_in_shard, 1024)
 ```
 
 Or pull just one model's embeddings for a single language:
 
 ```sh
-huggingface-cli download unum-cloud/WikiVerse \
+hf download ashvardanian/WikiVerse \
     --repo-type dataset \
     --include "qwen3-embedding-0.6b/enwiki/*"
 ```
