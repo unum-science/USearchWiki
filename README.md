@@ -92,64 +92,67 @@ Average article length across all languages is ~400 tokens, but this is dragged 
 
 ## Dataset Layout
 
-Data is published on HuggingFace with one __config per model__, so users download only what they need.
-Embedding vectors are stored as `.fbin` (row-major binary: `uint32 rows, uint32 cols, float16/float32 data`) for direct compatibility with [USearch bench_cpp](https://github.com/unum-cloud/usearch/blob/main/BENCHMARKS.md) and the Big-ANN benchmark ecosystem.
+Layout mirrors [FineWiki's](https://huggingface.co/datasets/HuggingFaceFW/finewiki) `data/<wiki>/<group>_<shard>.parquet` structure: one directory per Wikipedia language, with shard filenames preserved 1:1.
+Each `.f16bin` is row-aligned with its source parquet — `.f16bin` row N is the embedding of parquet row N, in native order.
+If the source text was empty or null the row is a zero vector (`norm == 0`); the parquet's `id` column provides the doc identifier, so no separate ids file is needed.
+
+Binary format: `u32` rows count, `u32` columns count, then `rows × cols` little-endian `f16` values — directly compatible with [USearch](https://github.com/unum-cloud/USearch)'s and the Big-ANN benchmark ecosystem.
+
+`.body.f16bin` is the article-body embedding; `.title.f16bin` is the title-only embedding (short-context, useful for title-vs-body retrieval studies).
 
 ```
 unum-cloud/WikiVerse/
 ├── README.md
+├── LICENSE
+├── .gitattributes
+├── wikiverse.py                              # consumer module: load_lang, read_bin, ...
+├── embed.py                                  # reference embedding pipeline (TEI-based)
 │
-├── corpus/
-│   ├── passages-en-00000-of-00050.parquet    # doc_id, title, text, section
-│   ├── passages-en-00001-of-00050.parquet
-│   └── ...
+├── qwen3-embedding-0.6b/                     # 1024-dim, decoder, float16
+│   ├── enwiki/
+│   │   ├── 000_00000.body.f16bin             # mirrors enwiki/000_00000.parquet
+│   │   ├── 000_00000.title.f16bin
+│   │   ├── 000_00001.body.f16bin
+│   │   ├── 000_00001.title.f16bin
+│   │   └── ...
+│   ├── dewiki/
+│   │   └── ...
+│   └── ...                                   # one dir per Wikipedia language
 │
-├── graph/
-│   ├── pagelinks-en.parquet                  # source_id, target_id
-│   ├── categories-en.parquet                 # page_id, category
-│   ├── wikidata-en.parquet                   # page_id, qid, entity_type
-│   └── ...
+├── snowflake-arctic-embed-l-v2.0/            # 1024-dim, encoder, float16
+│   └── <wiki>/<group>_<shard>.{body,title}.f16bin
 │
-├── qwen3-embedding-0.6b/
-│   ├── base.6.6M.f16bin                      # 6.6M × 1024, float16
-│   ├── query.10K.f16bin                      # 10K × 1024, float16
-│   └── groundtruth.10K.ibin                  # 10K × 100 neighbors
+├── nomic-embed-text-v1.5/                    #  768-dim, encoder, float16
+│   └── <wiki>/<group>_<shard>.{body,title}.f16bin
 │
-├── e5-mistral-7b-instruct/
-│   ├── base.6.6M.f16bin                      # 6.6M × 4096, float16
-│   ├── query.10K.f16bin
-│   └── groundtruth.10K.ibin
+├── e5-mistral-7b-instruct/                   # 4096-dim, decoder, float16 (planned)
+│   └── <wiki>/<group>_<shard>.{body,title}.f16bin
 │
-├── arctic-embed-l-v2.0/
-│   ├── base.6.6M.f16bin                      # 6.6M × 1024, float16
-│   ├── query.10K.f16bin
-│   └── groundtruth.10K.ibin
-│
-├── nomic-embed-text-v1.5/
-│   ├── base.6.6M.f16bin                      # 6.6M × 768, float16
-│   ├── query.10K.f16bin
-│   └── groundtruth.10K.ibin
-│
-└── gte-moderncolbert-v1/
-    ├── base.6.6M.f16bin                      # ~13.2B × 128, float16
-    ├── query.10K.f16bin
-    └── groundtruth.10K.ibin
+└── gte-moderncolbert-v1/                     #  128-dim per token, ColBERT (planned)
+    └── <wiki>/<group>_<shard>.{body,title}.f16bin
 ```
 
-Load a specific model's embeddings:
+Binary embedding files are tracked via [Git LFS](https://git-lfs.com).
+To clone the repo without downloading the binaries (~600 GB):
+
+```sh
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/unum-cloud/WikiVerse
+```
+
+Load embeddings for a single language (Python):
 
 ```python
-from datasets import load_dataset
-corpus = load_dataset("unum-cloud/WikiVerse", "corpus")
+from wikiverse import read_bin
+mat = read_bin("qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin", dtype="f16")
+# mat.shape == (n_articles_in_shard, 1024)
 ```
 
-Or download binary vectors directly for C++/Rust benchmarking:
+Or pull just one model's embeddings for a single language:
 
 ```sh
 huggingface-cli download unum-cloud/WikiVerse \
-    qwen3-embedding-0.6b/base.6.6M.f16bin \
-    qwen3-embedding-0.6b/query.10K.f16bin \
-    qwen3-embedding-0.6b/groundtruth.10K.ibin
+    --repo-type dataset \
+    --include "qwen3-embedding-0.6b/enwiki/*"
 ```
 
 ### Workflow

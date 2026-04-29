@@ -1,0 +1,114 @@
+"""WikiVerse: embeddings for FineWiki articles and titles."""
+
+from __future__ import annotations
+
+import re
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Literal
+
+import numpy as np
+import pyarrow.parquet as pq
+
+shard_pattern = re.compile(r"(\d{3})_(\d{5})\.parquet$")
+
+numpy_dtypes = {"f16": np.float16, "f32": np.float32, "i32": np.int32}
+file_extensions = {"f16": "f16bin", "f32": "fbin", "i32": "ibin"}
+
+DType = Literal["f16", "f32", "i32"]
+
+
+@dataclass(frozen=True, slots=True)
+class Shard:
+    wikiname: str
+    group: int
+    index: int
+    path: Path
+
+    @property
+    def stem(self) -> str:
+        return f"{self.group:03d}_{self.index:05d}"
+
+
+def find_snapshot(cache_dir: str | Path) -> Path:
+    cache_dir = Path(cache_dir)
+    snapshots = cache_dir / "datasets--HuggingFaceFW--finewiki" / "snapshots"
+    if not snapshots.is_dir():
+        raise FileNotFoundError(f"no FineWiki snapshot under {snapshots}")
+    return max(snapshots.iterdir(), key=lambda path: path.stat().st_mtime)
+
+
+def load_lang(cache_dir: str | Path, wikiname: str) -> list[Shard]:
+    """Discover all FineWiki shards for a single language."""
+    data_root = find_snapshot(cache_dir) / "data"
+    wiki_dir = data_root / wikiname
+    if not wiki_dir.is_dir():
+        raise FileNotFoundError(f"no shard directory for {wikiname}")
+    shards: list[Shard] = []
+    for parquet_path in sorted(wiki_dir.glob("*.parquet")):
+        match = shard_pattern.search(parquet_path.name)
+        if not match:
+            continue
+        shards.append(
+            Shard(
+                wikiname=wikiname,
+                group=int(match.group(1)),
+                index=int(match.group(2)),
+                path=parquet_path,
+            )
+        )
+    return shards
+
+
+def iter_articles(
+    shard: Shard, text_column: str = "text", id_column: str = "id"
+) -> Iterator[tuple[str, str]]:
+    """Yield (id, text) tuples from a parquet shard, in parquet row order.
+
+    Empty/null texts pass through as empty string — embedders should write
+    zero vectors so row N in .f16bin aligns with parquet row N.
+    """
+    table = pq.read_table(shard.path, columns=[id_column, text_column])
+    identifiers = table.column(id_column).to_pylist()
+    texts = table.column(text_column).to_pylist()
+    for identifier, text in zip(identifiers, texts):
+        yield str(identifier), text or ""
+
+
+def load_shard_texts(
+    shard: Shard, text_column: str = "text", id_column: str = "id"
+) -> tuple[list[str], list[str]]:
+    """Load a whole shard into parallel lists (ids, texts), parquet row order preserved."""
+    identifiers: list[str] = []
+    texts: list[str] = []
+    for identifier, text in iter_articles(
+        shard, text_column=text_column, id_column=id_column
+    ):
+        identifiers.append(identifier)
+        texts.append(text)
+    return identifiers, texts
+
+
+def write_bin(path: str | Path, matrix: np.ndarray, dtype: DType) -> None:
+    """Write a 2-D matrix to a binary file with a `uint32 rows, uint32 cols` header."""
+    if matrix.ndim != 2:
+        raise ValueError(f"expected 2-D matrix, got shape {matrix.shape}")
+    matrix = np.ascontiguousarray(matrix.astype(numpy_dtypes[dtype], copy=False))
+    rows, columns = matrix.shape
+    with open(path, "wb") as file:
+        file.write(struct.pack("<II", rows, columns))
+        file.write(matrix.tobytes(order="C"))
+
+
+def read_bin(path: str | Path, dtype: DType) -> np.ndarray:
+    """Read a 2-D matrix from a binary file with a `uint32 rows, uint32 cols` header."""
+    with open(path, "rb") as file:
+        rows, columns = struct.unpack("<II", file.read(8))
+        return np.frombuffer(file.read(), dtype=numpy_dtypes[dtype]).reshape(
+            rows, columns
+        )
+
+
+def shard_filename(stem: str, dtype: DType) -> str:
+    return f"{stem}.{file_extensions[dtype]}"
