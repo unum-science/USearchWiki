@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Literal
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -17,6 +18,8 @@ numpy_dtypes = {"f16": np.float16, "f32": np.float32, "i32": np.int32}
 file_extensions = {"f16": "f16bin", "f32": "fbin", "i32": "ibin"}
 
 DType = Literal["f16", "f32", "i32"]
+
+LFS_POINTER_PREFIX = b"version https://git-lfs"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +32,96 @@ class Shard:
     @property
     def stem(self) -> str:
         return f"{self.group:03d}_{self.index:05d}"
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionShard:
+    """A shard of an embedding collection, populated with its row count and the
+    row offset that would assign each of its rows a deterministic global flat ID
+    (used as the integer key for ground truth, USearch indexes, and any consumer
+    that wants to map vectors back to their source article)."""
+
+    wikiname: str
+    stem: str
+    path: Path
+    row_offset: int
+    row_count: int
+
+
+def resolve_lfs_pointer(path: Path) -> Path:
+    """If `path` is a Git-LFS pointer file, return the materialized blob in
+    `.git/lfs/objects`; otherwise return the path unchanged.
+
+    Pointer files are tiny ASCII stubs (~133 bytes) with an `oid sha256:<hex>`
+    line. Repositories cloned with `GIT_LFS_SKIP_SMUDGE=1` (or with `git lfs
+    fetch` only) keep the actual binaries under `.git/lfs/objects/<aa>/<bb>/<oid>`
+    while the working tree holds pointers. Reading those blobs in place avoids
+    checking out a duplicate copy of the dataset.
+    """
+    try:
+        if path.stat().st_size > 1024:
+            return path
+    except OSError:
+        return path
+    with open(path, "rb") as file:
+        head = file.read(256)
+    if not head.startswith(LFS_POINTER_PREFIX):
+        return path
+    oid: str | None = None
+    for line in head.decode("ascii", errors="ignore").splitlines():
+        if line.startswith("oid sha256:"):
+            oid = line.split(":", 1)[1].strip()
+            break
+    if not oid:
+        raise ValueError(f"{path}: looks like an LFS pointer but no sha256 oid line")
+    # Walk parents of the resolved path so symlinked working trees still find
+    # the original repo's `.git/lfs/objects`.
+    for ancestor in path.resolve().parents:
+        candidate = ancestor / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"{path}: LFS pointer references oid {oid} but no .git/lfs/objects/ contains it; "
+        f"run `git lfs fetch` or pass --output to a tree that has the blobs"
+    )
+
+
+def discover_collection(
+    model_root: Path, suffix: str = "body"
+) -> list[CollectionShard]:
+    """Walk an embedding collection's per-shard `.f16bin` files in canonical
+    order (sorted wikiname, then sorted shard stem), reading each header to
+    capture its row count, and return a list of `CollectionShard`s with
+    cumulative `row_offset`s assigned.
+
+    This is the *contract* for the global flat IDs: the i-th row of the n-th
+    shard (after this canonical walk) gets ID `shards[n].row_offset + i`.
+    Ground truth files, USearch index keys, and any consumer needing a
+    deterministic vector-to-article mapping should reproduce this walk.
+    """
+    if not model_root.is_dir():
+        raise FileNotFoundError(f"no model directory at {model_root}")
+    shards: list[CollectionShard] = []
+    cumulative = 0
+    for wiki_dir in sorted(model_root.iterdir()):
+        if not wiki_dir.is_dir():
+            continue
+        for path in sorted(wiki_dir.glob(f"*.{suffix}.f16bin")):
+            stem = path.name[: -len(f".{suffix}.f16bin")]
+            blob = resolve_lfs_pointer(path)
+            with open(blob, "rb") as file:
+                rows, _columns = struct.unpack("<II", file.read(8))
+            shards.append(
+                CollectionShard(
+                    wikiname=wiki_dir.name,
+                    stem=stem,
+                    path=path,
+                    row_offset=cumulative,
+                    row_count=rows,
+                )
+            )
+            cumulative += rows
+    return shards
 
 
 def find_snapshot(cache_dir: str | Path) -> Path:
@@ -72,7 +165,7 @@ def iter_articles(
     table = pq.read_table(shard.path, columns=[id_column, text_column])
     identifiers = table.column(id_column).to_pylist()
     texts = table.column(text_column).to_pylist()
-    for identifier, text in zip(identifiers, texts):
+    for identifier, text in zip(identifiers, texts, strict=True):
         yield str(identifier), text or ""
 
 

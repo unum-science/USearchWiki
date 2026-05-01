@@ -1,7 +1,11 @@
-"""Embed FineWiki shards via a running TEI server.
+"""Embed FineWiki shards via a running TEI server (one dense vector per article).
+
+The companion to `embed_sections.py`, which produces one vector per section
+via late-chunking ColBERT. This module is the simpler dense path: each
+article goes to TEI as a truncated document, gets back a single pooled vector.
 
 Usage:
-  python embed.py --cache-dir /path/to/hf-cache --output /path/to/embeddings \\
+  python embed_articles.py --cache-dir /path/to/hf-cache --output /path/to/embeddings \\
       --wiki enwiki --model-subdir qwen3-embedding-0.6b --dimensions 1024
 
 For title embeddings, add: --text-column title --output-suffix title --char-cap 256
@@ -103,7 +107,7 @@ async def run(args: argparse.Namespace) -> None:
             )
             response.raise_for_status()
         except Exception as error:
-            raise SystemExit(f"TEI not reachable at {args.url}: {error}")
+            raise SystemExit(f"TEI not reachable at {args.url}: {error}") from error
 
     async with httpx.AsyncClient() as client:
         for shard in pending:

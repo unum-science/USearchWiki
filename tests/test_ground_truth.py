@@ -12,8 +12,6 @@ or directly:
 
 from __future__ import annotations
 
-import json
-import struct
 import subprocess
 import sys
 import tempfile
@@ -24,7 +22,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from wikiverse import write_bin, read_bin  # noqa: E402
+from wikiverse import read_bin, write_bin  # noqa: E402
 
 
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -70,8 +68,8 @@ def assemble_per_shard(
     model_root: Path, suffix: str, extension: str, dtype: str
 ) -> np.ndarray:
     """Read every `{wiki}/{stem}.{suffix}.ground_truth.{extension}` and
-    concatenate in the same deterministic order discover_shards uses (sorted
-    wikiname, then sorted stem)."""
+    concatenate in the same deterministic order discover_collection uses
+    (sorted wikiname, then sorted stem)."""
     parts: list[np.ndarray] = []
     for wiki_dir in sorted(model_root.iterdir()):
         if not wiki_dir.is_dir():
@@ -87,8 +85,6 @@ def reference_topk(
     """Brute-force exact top-k via NumPy float32 matmul, with self-match dropped."""
     f32 = embeddings.astype(np.float32)
     similarity = f32 @ f32.T
-    total = embeddings.shape[0]
-    # Drop self-match by setting diagonal to -inf, then take top-k.
     np.fill_diagonal(similarity, -np.inf)
     top_indices = np.argsort(-similarity, axis=1)[:, :num_neighbors].astype(np.int32)
     top_scores = np.take_along_axis(similarity, top_indices, axis=1).astype(np.float32)

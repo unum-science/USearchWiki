@@ -17,88 +17,16 @@ import multiprocessing as mp
 import os
 import struct
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from wikiverse import write_bin
-
-
-LFS_POINTER_PREFIX = b"version https://git-lfs"
-
-
-def resolve_lfs_pointer(path: Path) -> Path:
-    """If `path` is a Git-LFS pointer file, return the materialized blob in `.git/lfs/objects`.
-
-    Pointer files are tiny ASCII stubs (~133 bytes) with an `oid sha256:<hex>` line.
-    Repositories cloned with `GIT_LFS_SKIP_SMUDGE=1` (or with `git lfs fetch` only)
-    keep the actual binaries under `.git/lfs/objects/<aa>/<bb>/<oid>` while the
-    working tree holds pointers. Reading those blobs in place avoids checking out
-    a duplicate copy of the dataset.
-    """
-    try:
-        if path.stat().st_size > 1024:
-            return path
-    except OSError:
-        return path
-    with open(path, "rb") as file:
-        head = file.read(256)
-    if not head.startswith(LFS_POINTER_PREFIX):
-        return path
-    oid: str | None = None
-    for line in head.decode("ascii", errors="ignore").splitlines():
-        if line.startswith("oid sha256:"):
-            oid = line.split(":", 1)[1].strip()
-            break
-    if not oid:
-        raise ValueError(f"{path}: looks like an LFS pointer but no sha256 oid line")
-    # Walk parents of the resolved path (so symlinked working trees still find the
-    # original repo's `.git/lfs/objects`).
-    for ancestor in path.resolve().parents:
-        candidate = ancestor / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"{path}: LFS pointer references oid {oid} but no .git/lfs/objects/ contains it; "
-        f"run `git lfs fetch` or pass --output to a tree that has the blobs"
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class CollectionShard:
-    wikiname: str
-    stem: str
-    row_offset: int
-    row_count: int
-
-
-def discover_shards(model_root: Path, suffix: str) -> list[CollectionShard]:
-    """Find every {wiki}/{stem}.{suffix}.f16bin under model_root in deterministic order."""
-    binaries: list[tuple[str, str, Path, int]] = []
-    for wiki_dir in sorted(model_root.iterdir()):
-        if not wiki_dir.is_dir():
-            continue
-        for path in sorted(wiki_dir.glob(f"*.{suffix}.f16bin")):
-            stem = path.name[: -len(f".{suffix}.f16bin")]
-            blob_path = resolve_lfs_pointer(path)
-            with open(blob_path, "rb") as file:
-                rows, _columns = struct.unpack("<II", file.read(8))
-            binaries.append((wiki_dir.name, stem, path, rows))
-
-    shards: list[CollectionShard] = []
-    offset = 0
-    for wikiname, stem, _path, row_count in binaries:
-        shards.append(
-            CollectionShard(
-                wikiname=wikiname,
-                stem=stem,
-                row_offset=offset,
-                row_count=row_count,
-            )
-        )
-        offset += row_count
-    return shards
+from wikiverse import (
+    CollectionShard,
+    discover_collection,
+    resolve_lfs_pointer,
+    write_bin,
+)
 
 
 def load_collection(
@@ -432,9 +360,10 @@ def gather_outputs(
             wiki_dir.mkdir(parents=True, exist_ok=True)
             indices_path = wiki_dir / f"{shard.stem}.{suffix}.ground_truth.ibin"
             scores_path = wiki_dir / f"{shard.stem}.{suffix}.ground_truth.fbin"
-            with open(indices_path, "wb") as out_indices, open(
-                scores_path, "wb"
-            ) as out_scores:
+            with (
+                open(indices_path, "wb") as out_indices,
+                open(scores_path, "wb") as out_scores,
+            ):
                 out_indices.write(struct.pack("<II", shard.row_count, num_neighbors))
                 out_scores.write(struct.pack("<II", shard.row_count, num_neighbors))
                 cursor = shard.row_offset
@@ -508,7 +437,7 @@ def main() -> None:
     if not model_root.is_dir():
         raise SystemExit(f"no collection at {model_root}")
 
-    shards = discover_shards(model_root, args.output_suffix)
+    shards = discover_collection(model_root, args.output_suffix)
     if not shards:
         raise SystemExit(f"no .{args.output_suffix}.f16bin files under {model_root}")
     total_vectors = sum(shard.row_count for shard in shards)

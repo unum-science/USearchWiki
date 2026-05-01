@@ -211,3 +211,7 @@ data/
 state/
 benchmarks/results/
 logs/
+
+# Local-only orchestration shell scripts (kept under /home/ubuntu/wikiverse-data/scripts/
+# in this workstation, not part of the published repo).
+*.sh
