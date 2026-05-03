@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 
-from wikiverse import Shard, load_lang, load_shard_texts, write_bin
+from usearchwiki import Shard, load_lang, load_shard_texts, write_bin
 
 
 def select_shards(all_shards: list[Shard], gpu_id: int, world_size: int) -> list[Shard]:

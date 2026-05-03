@@ -149,7 +149,7 @@ unum-cloud/USearchWiki/
 ├── README.md
 ├── LICENSE
 ├── .gitattributes
-├── wikiverse.py                              # consumer module: load_lang, read_bin, discover_collection, ...
+├── usearchwiki.py                            # consumer module: load_lang, read_bin, discover_collection, ...
 ├── embed_articles.py                         # one dense vector per article, via TEI
 ├── embed_sections.py                         # late-chunking ColBERT: one vector per section
 ├── late_chunking.py                          # section-aware windowing primitives
@@ -233,7 +233,7 @@ git lfs checkout
 ### Loading embeddings in Python
 
 ```python
-from wikiverse import read_bin
+from usearchwiki import read_bin
 matrix = read_bin("qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin", dtype="f16")
 # matrix.shape == (rows_in_shard, 1024)
 ```

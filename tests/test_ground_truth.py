@@ -22,7 +22,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from wikiverse import read_bin, write_bin  # noqa: E402
+from usearchwiki import read_bin, write_bin  # noqa: E402
 
 
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:
