@@ -1,25 +1,23 @@
-"""Brute-force retrievers + shared GPU kernels.
+"""Brute-force retrievers and shared GPU kernels.
 
-Two retriever families share one streaming-top-k template:
-  - DenseRetriever: cosine top-k over an `(N, dim)` FP16 corpus.
-  - MaxSimRetriever: ColBERT-style late interaction over a multi-vector
-    corpus (`(T_total, dim)` token bank + `(N+1,)` section offsets).
+Two retrieval families share one streaming-top-k template — different inner
+score kernel, same outer machinery (resident query stripe, double-buffered
+H2D candidate tiles, pre-allocated FP32 similarity buffer):
 
-Both compute an `(Q, M)` score matrix per candidate tile, merge it into the
-running top-k, and repeat. They differ only in the per-tile score kernel:
+  - **Dense** — cosine top-k over an `(N, dim)` FP16 corpus. Inner kernel is
+    one FP16 matmul into a pre-allocated FP32 ``out=`` buffer.
+  - **MaxSim** — ColBERT-style late interaction over a multi-vector corpus
+    (``(T_total, dim)`` token bank + ``(N+1,)`` section offsets). Inner
+    kernel is matmul + segment-max over ragged doc-token offsets +
+    segment-sum over ragged query-token offsets, via two small CUDA
+    RawKernels.
 
-  - Dense: a single FP16 matmul into a pre-allocated FP32 `out=` buffer.
-  - MaxSim: matmul + segment-max along ragged doc-token offsets +
-    segment-sum along ragged query-token offsets, via two small RawKernels.
-
-The same streaming loop is exposed two ways:
-  - `gt_stripe_*` functions: per-GPU stripe workers used by `ground_truth.py`
-    for the all-vs-all corpus sweep (host-resident corpus, double-buffered
-    H2D for candidate tiles, query stripe resident on-device).
-  - `DenseRetriever` / `MaxSimRetriever` classes: consumer-facing search,
+Each path exposes itself two ways:
+  - ``gt_stripe_*`` — one-shot per-GPU stripe worker used by
+    ``ground_truth.py`` for the all-vs-all corpus sweep.
+  - ``DenseRetriever`` / ``MaxSimRetriever`` — consumer-facing search,
     corpus loaded once at construction and held resident on a single GPU.
-    `search()` becomes a single `gt_stripe_*` call with the resident corpus
-    used as the candidate stream.
+    ``search()`` runs a single matmul + top-k against the resident corpus.
 """
 
 from __future__ import annotations
@@ -37,10 +35,26 @@ from usearchwiki import (
 )
 
 
-# Two ragged-segment reductions for MaxSim. Each thread handles one (row,
-# segment) cell; the inner loop is bounded by the segment width (median 3,
-# p99 ~16 for FineWiki sections, so a single warp easily covers the worst
-# rows without divergence pain).
+# region: Common utilities
+
+
+def _read_header(path: Path) -> tuple[int, int]:
+    blob = resolve_lfs_pointer(path)
+    with open(blob, "rb") as file:
+        rows, columns = struct.unpack("<II", file.read(8))
+    return rows, columns
+
+
+# endregion
+
+
+# region: GPU kernels
+
+# Two ragged-segment reductions for MaxSim. Each thread handles one
+# (row, segment) cell; the inner loop is bounded by the segment width
+# (median 3, p99 ~16 for FineWiki sections, so a single warp easily covers
+# the worst rows without divergence pain).
+
 _SEGMENT_MAX_SRC = r"""
 extern "C" __global__ void segment_max_2d(
     const float* __restrict__ values,
@@ -53,7 +67,12 @@ extern "C" __global__ void segment_max_2d(
     if (row >= rows || seg >= n_segments) return;
     int start = offsets[seg];
     int end   = offsets[seg + 1];
-    const float* row_ptr = values + row * row_stride;
+    // 64-bit offset arithmetic: with a 7.7M-section stripe and
+    // query_tile_sections=2048, the max sliding-window query-token count
+    // can hit ~32K; combined with max_tile_tokens ~100K, row * row_stride
+    // exceeds INT32_MAX. The output stride is bounded by
+    // candidate_tile_sections (≤ ~32K), so 32-bit math is fine for `out`.
+    const float* row_ptr = values + (long long)row * (long long)row_stride;
     float best = -3.4e38f;
     for (int t = start; t < end; ++t) {
         float v = row_ptr[t];
@@ -68,13 +87,14 @@ extern "C" __global__ void segment_sum_2d(
     const float* __restrict__ values,
     const int* __restrict__ offsets,
     float* __restrict__ out,
-    int n_segments, int n_cols, int row_stride, int out_stride
+    int n_segments, int n_cols, int row_stride, int out_stride,
+    int offset_base
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int seg = blockIdx.y * blockDim.y + threadIdx.y;
     if (seg >= n_segments || col >= n_cols) return;
-    int start = offsets[seg];
-    int end   = offsets[seg + 1];
+    int start = offsets[seg]     - offset_base;
+    int end   = offsets[seg + 1] - offset_base;
     float total = 0.0f;
     for (int t = start; t < end; ++t) {
         total += values[t * row_stride + col];
@@ -88,6 +108,10 @@ _SEGMENT_SUM_KERNEL = None
 
 
 def _segment_kernels():
+    """Compile and cache the two RawKernels on first use. Lazy because cupy
+    initializes a CUDA context on import — we want that deferred until inside
+    the worker process (post-fork).
+    """
     global _SEGMENT_MAX_KERNEL, _SEGMENT_SUM_KERNEL
     if _SEGMENT_MAX_KERNEL is None:
         import cupy
@@ -97,66 +121,15 @@ def _segment_kernels():
     return _SEGMENT_MAX_KERNEL, _SEGMENT_SUM_KERNEL
 
 
-def _topk_merge(
-    running_scores,
-    running_indices,
-    tile_scores,
-    tile_indices,
-    keep,
-):
-    """Merge a (rows, keep) running top-k with a (rows, *) tile top-k. Returns
-    the new top-k. `tile_scores` / `tile_indices` may already be (rows, keep)
-    (precomputed via `torch.topk` on the full tile-similarity row) or wider.
-    """
-    import cupy
-    import torch
-
-    combined_scores = cupy.concatenate([running_scores, tile_scores], axis=1)
-    combined_indices = cupy.concatenate([running_indices, tile_indices], axis=1)
-    combined_torch = torch.from_dlpack(combined_scores)
-    merge_values, merge_pos = torch.topk(
-        combined_torch, k=keep, dim=1, largest=True, sorted=False
-    )
-    new_scores = cupy.from_dlpack(merge_values)
-    new_indices = cupy.take_along_axis(combined_indices, cupy.from_dlpack(merge_pos), axis=1)
-    return new_scores, new_indices
+# endregion
 
 
-def _tile_topk_dense(similarity_view, keep, candidate_offset_global, query_count, active_count):
-    """Top-k inside one (Q, M) FP32 similarity tile -> global indices. Pads to
-    `keep` columns when the tile is shorter than `keep`.
-    """
-    import cupy
-    import torch
-
-    if active_count >= keep:
-        sim_torch = torch.from_dlpack(similarity_view)
-        values, local = torch.topk(sim_torch, k=keep, dim=1, largest=True, sorted=False)
-        return (
-            cupy.from_dlpack(values),
-            cupy.from_dlpack(local).astype(cupy.int32) + cupy.int32(candidate_offset_global),
-        )
-    pad = keep - active_count
-    sub_global = cupy.arange(active_count, dtype=cupy.int32) + cupy.int32(
-        candidate_offset_global
-    )
-    indices = cupy.concatenate(
-        [
-            cupy.broadcast_to(sub_global, (query_count, active_count)),
-            cupy.full((query_count, pad), -1, dtype=cupy.int32),
-        ],
-        axis=1,
-    )
-    scores = cupy.concatenate(
-        [similarity_view, cupy.full((query_count, pad), -cupy.inf, dtype=cupy.float32)],
-        axis=1,
-    )
-    return scores, indices
+# region: Top-k primitives
 
 
-def _drop_self(sorted_scores, sorted_indices, query_global_ids, num_neighbors):
-    """Sort each row by descending score, then drop the (up-to-one) row whose
-    index equals the query's own global id. Pure cupy, vectorized over rows.
+def _drop_self_match(sorted_scores, sorted_indices, query_global_ids, num_neighbors):
+    """Drop the (up-to-one) row whose index equals the query's own global
+    id — call after `cupy.argsort(-scores)`. Pure cupy, vectorized over rows.
     """
     import cupy
 
@@ -174,6 +147,246 @@ def _drop_self(sorted_scores, sorted_indices, query_global_ids, num_neighbors):
     return final_indices, final_scores
 
 
+def _topk_merge(running_scores, running_indices, tile_scores, tile_indices, keep):
+    """Merge a `(rows, keep)` running top-k with a `(rows, *)` tile top-k.
+    Returns the new `(rows, keep)` top-k. Allocates new arrays — used by the
+    dense path, where matmul size makes the per-iter alloc cost negligible.
+    """
+    import cupy
+    import torch
+
+    combined_scores = cupy.concatenate([running_scores, tile_scores], axis=1)
+    combined_indices = cupy.concatenate([running_indices, tile_indices], axis=1)
+    combined_torch = torch.from_dlpack(combined_scores)
+    merge_values, merge_pos = torch.topk(
+        combined_torch, k=keep, dim=1, largest=True, sorted=False
+    )
+    new_scores = cupy.from_dlpack(merge_values)
+    new_indices = cupy.take_along_axis(
+        combined_indices, cupy.from_dlpack(merge_pos), axis=1
+    )
+    return new_scores, new_indices
+
+
+def _tile_topk(
+    similarity_view, keep, candidate_offset_global, query_count, active_count
+):
+    """Top-k inside one `(Q, M)` FP32 similarity tile, lifting local indices
+    to global. Pads to `keep` columns when the tile is shorter than `keep`.
+    """
+    import cupy
+    import torch
+
+    if active_count >= keep:
+        sim_torch = torch.from_dlpack(similarity_view)
+        values, local = torch.topk(
+            sim_torch, k=keep, dim=1, largest=True, sorted=False
+        )
+        return (
+            cupy.from_dlpack(values),
+            cupy.from_dlpack(local).astype(cupy.int32)
+            + cupy.int32(candidate_offset_global),
+        )
+    pad = keep - active_count
+    sub_global = cupy.arange(active_count, dtype=cupy.int32) + cupy.int32(
+        candidate_offset_global
+    )
+    indices = cupy.concatenate(
+        [
+            cupy.broadcast_to(sub_global, (query_count, active_count)),
+            cupy.full((query_count, pad), -1, dtype=cupy.int32),
+        ],
+        axis=1,
+    )
+    scores = cupy.concatenate(
+        [
+            similarity_view,
+            cupy.full((query_count, pad), -cupy.inf, dtype=cupy.float32),
+        ],
+        axis=1,
+    )
+    return scores, indices
+
+
+# endregion
+
+
+# region: Dense path
+
+
+class _DenseStripeRunner:
+    """Per-GPU runner for the dense all-vs-all top-k sweep.
+
+    Owns the resident query stripe, the double-buffered H2D candidate tiles,
+    the pre-allocated FP32 similarity buffer, and the running top-k state.
+    One instance per ``gt_stripe_dense()`` call.
+    """
+
+    def __init__(
+        self,
+        embeddings_host,
+        stripe_start,
+        stripe_end,
+        num_neighbors,
+        query_tile_rows,
+        candidate_tile_rows,
+        log_prefix,
+    ):
+        import cupy
+
+        self.embeddings_host = embeddings_host
+        self.stripe_start = stripe_start
+        self.stripe_end = stripe_end
+        self.stripe_size = stripe_end - stripe_start
+        self.num_neighbors = num_neighbors
+        self.query_tile_rows = query_tile_rows
+        self.candidate_tile_rows = candidate_tile_rows
+        self.log_prefix = log_prefix
+        self.keep = num_neighbors + 1
+
+        total_vectors, dimensions = embeddings_host.shape
+        self.total_vectors = total_vectors
+        self.dimensions = dimensions
+
+        self.query_stripe = cupy.asarray(embeddings_host[stripe_start:stripe_end])
+
+        self.pinned_holders: list = []
+        self.pinned_views: list[np.ndarray] = []
+        for _ in range(2):
+            pinned = cupy.cuda.alloc_pinned_memory(
+                candidate_tile_rows * dimensions * 2
+            )
+            self.pinned_holders.append(pinned)
+            view = np.frombuffer(
+                pinned, dtype=np.float16, count=candidate_tile_rows * dimensions
+            ).reshape(candidate_tile_rows, dimensions)
+            self.pinned_views.append(view)
+        self.candidate_buffers = [
+            cupy.empty((candidate_tile_rows, dimensions), dtype=cupy.float16),
+            cupy.empty((candidate_tile_rows, dimensions), dtype=cupy.float16),
+        ]
+        self.similarity_buffer = cupy.empty(
+            (query_tile_rows, candidate_tile_rows), dtype=cupy.float32
+        )
+
+        self.topk_scores = cupy.full(
+            (self.stripe_size, self.keep), -cupy.inf, dtype=cupy.float32
+        )
+        self.topk_indices = cupy.full(
+            (self.stripe_size, self.keep), -1, dtype=cupy.int32
+        )
+
+        self.copy_stream = cupy.cuda.Stream(non_blocking=True)
+        self.compute_stream = cupy.cuda.Stream(non_blocking=True)
+        self.copy_done = [cupy.cuda.Event(disable_timing=True) for _ in range(2)]
+        self.compute_done = [cupy.cuda.Event(disable_timing=True) for _ in range(2)]
+
+        self.candidate_offsets = list(range(0, total_vectors, candidate_tile_rows))
+
+    def _stage_tile(self, slot: int, tile_offset: int) -> int:
+        count = min(self.candidate_tile_rows, self.total_vectors - tile_offset)
+        self.copy_done[slot].synchronize()
+        np.copyto(
+            self.pinned_views[slot][:count],
+            self.embeddings_host[tile_offset : tile_offset + count],
+        )
+        self.copy_stream.wait_event(self.compute_done[slot])
+        self.candidate_buffers[slot][:count].set(
+            self.pinned_views[slot][:count], stream=self.copy_stream
+        )
+        self.copy_done[slot].record(self.copy_stream)
+        return count
+
+    def _score_microbatch(
+        self, active_device, active_count, tile_offset, query_start, query_end
+    ):
+        import cupy
+
+        query_count = query_end - query_start
+        similarity_view = self.similarity_buffer[:query_count, :active_count]
+        cupy.matmul(
+            self.query_stripe[query_start:query_end],
+            active_device.T,
+            out=similarity_view,
+        )
+        tile_scores, tile_indices = _tile_topk(
+            similarity_view, self.keep, tile_offset, query_count, active_count
+        )
+        new_scores, new_indices = _topk_merge(
+            self.topk_scores[query_start:query_end],
+            self.topk_indices[query_start:query_end],
+            tile_scores,
+            tile_indices,
+            self.keep,
+        )
+        self.topk_scores[query_start:query_end] = new_scores
+        self.topk_indices[query_start:query_end] = new_indices
+
+    def _maybe_log_progress(self, tile_idx: int, started: float):
+        import cupy
+
+        last = tile_idx + 1 == len(self.candidate_offsets)
+        if (tile_idx + 1) % 32 != 0 and not last:
+            return
+        self.compute_stream.synchronize()
+        cupy.get_default_memory_pool().free_all_blocks()
+        elapsed = time.monotonic() - started
+        done = (tile_idx + 1) * self.candidate_tile_rows
+        rate = done / max(elapsed, 1e-3) / 1e6
+        print(
+            f"{self.log_prefix}tile {tile_idx + 1}/{len(self.candidate_offsets)} "
+            f"elapsed {elapsed:.0f}s ({rate:.2f}M cand/s)",
+            flush=True,
+        )
+
+    def _finalize(self) -> tuple[np.ndarray, np.ndarray]:
+        import cupy
+
+        sorted_order = cupy.argsort(-self.topk_scores, axis=1)
+        sorted_scores = cupy.take_along_axis(self.topk_scores, sorted_order, axis=1)
+        sorted_indices = cupy.take_along_axis(self.topk_indices, sorted_order, axis=1)
+        query_global_ids = cupy.arange(
+            self.stripe_start, self.stripe_end, dtype=cupy.int32
+        )
+        final_indices, final_scores = _drop_self_match(
+            sorted_scores, sorted_indices, query_global_ids, self.num_neighbors
+        )
+        return cupy.asnumpy(final_indices), cupy.asnumpy(final_scores)
+
+    def run(self) -> tuple[np.ndarray, np.ndarray]:
+        counts = [0, 0]
+        for slot in range(min(2, len(self.candidate_offsets))):
+            counts[slot] = self._stage_tile(slot, self.candidate_offsets[slot])
+
+        started = time.monotonic()
+        for tile_idx, tile_offset in enumerate(self.candidate_offsets):
+            slot = tile_idx % 2
+            active_count = counts[slot]
+            active_device = self.candidate_buffers[slot][:active_count]
+            self.compute_stream.wait_event(self.copy_done[slot])
+
+            with self.compute_stream:
+                for query_start in range(0, self.stripe_size, self.query_tile_rows):
+                    query_end = min(
+                        query_start + self.query_tile_rows, self.stripe_size
+                    )
+                    self._score_microbatch(
+                        active_device, active_count, tile_offset, query_start, query_end
+                    )
+                self.compute_done[slot].record(self.compute_stream)
+
+            prefetch_idx = tile_idx + 2
+            if prefetch_idx < len(self.candidate_offsets):
+                counts[slot] = self._stage_tile(
+                    slot, self.candidate_offsets[prefetch_idx]
+                )
+
+            self._maybe_log_progress(tile_idx, started)
+
+        self.compute_stream.synchronize()
+        return self._finalize()
+
+
 def gt_stripe_dense(
     embeddings_host: np.ndarray,
     stripe_start: int,
@@ -182,129 +395,553 @@ def gt_stripe_dense(
     query_tile_rows: int,
     candidate_tile_rows: int,
     log_prefix: str = "",
-):
-    """Compute top-k for `embeddings_host[stripe_start:stripe_end]` against
-    the *whole* `embeddings_host` corpus, with double-buffered H2D streaming
-    of candidate tiles. Returns `(indices, scores)` numpy arrays of shape
-    `(stripe_end - stripe_start, num_neighbors)` in i32 / f32.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute exact top-k for ``embeddings_host[stripe_start:stripe_end]``
+    against the *whole* ``embeddings_host`` corpus, with double-buffered H2D
+    streaming of candidate tiles. Returns ``(indices, scores)`` numpy arrays
+    of shape ``(stripe_end - stripe_start, num_neighbors)`` in i32 / f32.
 
-    Caller is responsible for picking the GPU (`CUDA_VISIBLE_DEVICES`).
+    Caller picks the GPU via ``CUDA_VISIBLE_DEVICES``.
     """
-    import cupy
-    import torch  # noqa: F401  (used inside helpers)
+    return _DenseStripeRunner(
+        embeddings_host,
+        stripe_start,
+        stripe_end,
+        num_neighbors,
+        query_tile_rows,
+        candidate_tile_rows,
+        log_prefix,
+    ).run()
 
-    total_vectors, dimensions = embeddings_host.shape
-    stripe_size = stripe_end - stripe_start
-    keep = num_neighbors + 1
 
-    query_stripe = cupy.asarray(embeddings_host[stripe_start:stripe_end])
+def load_dense_corpus(
+    model_root: Path, suffix: str, shards: list[CollectionShard]
+) -> tuple[np.ndarray, int]:
+    """Load every shard of a dense collection into one host FP16 array.
+    Sanitizes non-finite rows (a handful of WikiVerse f16bin files contain
+    stray NaN/Inf — see project memory).
+    """
+    if not shards:
+        raise ValueError(f"no shards under {model_root}")
+    _, dimensions = _read_header(shards[0].path)
+    total = sum(shard.row_count for shard in shards)
+    embeddings = np.empty((total, dimensions), dtype=np.float16)
+    for shard in shards:
+        blob = resolve_lfs_pointer(shard.path)
+        with open(blob, "rb") as file:
+            file.seek(8)
+            destination = embeddings[
+                shard.row_offset : shard.row_offset + shard.row_count
+            ]
+            file.readinto(memoryview(destination))  # type: ignore[arg-type]
+    bad = ~np.isfinite(embeddings).all(axis=1)
+    if bad.any():
+        embeddings[bad] = 0
+    return embeddings, dimensions
 
-    pinned_holders = []
-    pinned_views: list[np.ndarray] = []
-    for _ in range(2):
-        pinned = cupy.cuda.alloc_pinned_memory(candidate_tile_rows * dimensions * 2)
-        pinned_holders.append(pinned)
-        view = np.frombuffer(
-            pinned, dtype=np.float16, count=candidate_tile_rows * dimensions
-        ).reshape(candidate_tile_rows, dimensions)
-        pinned_views.append(view)
 
-    candidate_buffers = [
-        cupy.empty((candidate_tile_rows, dimensions), dtype=cupy.float16),
-        cupy.empty((candidate_tile_rows, dimensions), dtype=cupy.float16),
-    ]
-    similarity_buffer = cupy.empty(
-        (query_tile_rows, candidate_tile_rows), dtype=cupy.float32
-    )
-    topk_scores = cupy.full((stripe_size, keep), -cupy.inf, dtype=cupy.float32)
-    topk_indices = cupy.full((stripe_size, keep), -1, dtype=cupy.int32)
+class DenseRetriever:
+    """Brute-force exact cosine top-k for a dense embedding collection.
 
-    copy_stream = cupy.cuda.Stream(non_blocking=True)
-    compute_stream = cupy.cuda.Stream(non_blocking=True)
-    copy_done = [
-        cupy.cuda.Event(disable_timing=True),
-        cupy.cuda.Event(disable_timing=True),
-    ]
-    compute_done = [
-        cupy.cuda.Event(disable_timing=True),
-        cupy.cuda.Event(disable_timing=True),
-    ]
+    Loads the entire ``(N, dim)`` FP16 corpus to one GPU at construction.
+    Each ``search()`` call runs a single matmul + top-k against the resident
+    corpus. For ~120 GB collections (60M × 1024 FP16) the corpus does NOT
+    fit on a single 80 GB H100 — quantize on-disk before instantiating, or
+    use the multi-GPU ``gt_stripe_dense`` path directly. This class is
+    designed for moderate-size collections (≤ tens of GB).
+    """
 
-    candidate_offsets = list(range(0, total_vectors, candidate_tile_rows))
+    def __init__(
+        self,
+        model_root: str | Path,
+        suffix: str = "body",
+        device_id: int = 0,
+    ):
+        import os
 
-    def stage(slot: int, tile_offset: int) -> int:
-        count = min(candidate_tile_rows, total_vectors - tile_offset)
-        copy_done[slot].synchronize()
-        np.copyto(
-            pinned_views[slot][:count],
-            embeddings_host[tile_offset : tile_offset + count],
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        import cupy
+
+        model_root = Path(model_root)
+        self.model_root = model_root
+        self.suffix = suffix
+        self.shards = discover_collection(model_root, suffix)
+        embeddings_host, self.dimensions = load_dense_corpus(
+            model_root, suffix, self.shards
         )
-        copy_stream.wait_event(compute_done[slot])
-        candidate_buffers[slot][:count].set(pinned_views[slot][:count], stream=copy_stream)
-        copy_done[slot].record(copy_stream)
-        return count
+        self.total_vectors = embeddings_host.shape[0]
+        # Resident on GPU — subsequent searches are bound by the matmul.
+        self.corpus_device = cupy.asarray(embeddings_host)
 
-    counts = [0, 0]
-    for slot in range(min(2, len(candidate_offsets))):
-        counts[slot] = stage(slot, candidate_offsets[slot])
+    def search(
+        self, query_vectors: np.ndarray, k: int = 10
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``query_vectors``: ``(Q, dim)`` FP16, already L2-normalized.
+        Returns ``(scores, indices)`` — both ``(Q, k)`` numpy arrays.
+        """
+        import cupy
+        import torch
 
-    started = time.monotonic()
-    for tile_idx, tile_offset in enumerate(candidate_offsets):
-        slot = tile_idx % 2
-        active_count = counts[slot]
-        active_device = candidate_buffers[slot][:active_count]
-        compute_stream.wait_event(copy_done[slot])
-
-        with compute_stream:
-            for query_start in range(0, stripe_size, query_tile_rows):
-                query_end = min(query_start + query_tile_rows, stripe_size)
-                query_count = query_end - query_start
-                similarity_view = similarity_buffer[:query_count, :active_count]
-                cupy.matmul(
-                    query_stripe[query_start:query_end],
-                    active_device.T,
-                    out=similarity_view,
-                )
-                tile_scores, tile_indices = _tile_topk_dense(
-                    similarity_view, keep, tile_offset, query_count, active_count
-                )
-                new_scores, new_indices = _topk_merge(
-                    topk_scores[query_start:query_end],
-                    topk_indices[query_start:query_end],
-                    tile_scores,
-                    tile_indices,
-                    keep,
-                )
-                topk_scores[query_start:query_end] = new_scores
-                topk_indices[query_start:query_end] = new_indices
-            compute_done[slot].record(compute_stream)
-
-        prefetch_idx = tile_idx + 2
-        if prefetch_idx < len(candidate_offsets):
-            counts[slot] = stage(slot, candidate_offsets[prefetch_idx])
-
-        if (tile_idx + 1) % 32 == 0 or tile_idx + 1 == len(candidate_offsets):
-            compute_stream.synchronize()
-            cupy.get_default_memory_pool().free_all_blocks()
-            elapsed = time.monotonic() - started
-            done = (tile_idx + 1) * candidate_tile_rows
-            rate = done / max(elapsed, 1e-3) / 1e6
-            print(
-                f"{log_prefix}tile {tile_idx + 1}/{len(candidate_offsets)} "
-                f"elapsed {elapsed:.0f}s ({rate:.2f}M cand/s)",
-                flush=True,
+        if query_vectors.ndim != 2 or query_vectors.shape[1] != self.dimensions:
+            raise ValueError(
+                f"queries shape {query_vectors.shape} != (?, {self.dimensions})"
             )
+        queries_dev = cupy.asarray(query_vectors.astype(np.float16, copy=False))
+        sim = cupy.matmul(queries_dev, self.corpus_device.T, dtype=cupy.float32)
+        sim_torch = torch.from_dlpack(sim)
+        values, local = torch.topk(sim_torch, k=k, dim=1, largest=True, sorted=True)
+        return cupy.asnumpy(cupy.from_dlpack(values)), cupy.asnumpy(
+            cupy.from_dlpack(local).astype(cupy.int32)
+        )
 
-    compute_stream.synchronize()
 
-    sorted_order = cupy.argsort(-topk_scores, axis=1)
-    sorted_scores = cupy.take_along_axis(topk_scores, sorted_order, axis=1)
-    sorted_indices = cupy.take_along_axis(topk_indices, sorted_order, axis=1)
-    query_global_ids = cupy.arange(stripe_start, stripe_end, dtype=cupy.int32)
-    final_indices, final_scores = _drop_self(
-        sorted_scores, sorted_indices, query_global_ids, num_neighbors
-    )
-    return cupy.asnumpy(final_indices), cupy.asnumpy(final_scores)
+# endregion
+
+
+# region: MaxSim path
+
+
+class _MaxSimStripeRunner:
+    """Per-GPU runner for the MaxSim all-vs-all top-k sweep.
+
+    Owns the resident query-stripe token bank, the double-buffered H2D
+    candidate token tiles, the pre-allocated FP32 similarity / per-token-max
+    / score buffers, and the running top-k state. One instance per
+    ``gt_stripe_maxsim()`` call.
+
+    The hot loop is bound by Python + allocator overhead at ~1 ms/iter, so
+    every per-microbatch buffer is pre-allocated once in `__init__` and
+    reused. All torch ops in `_score_microbatch` run on the cupy compute
+    stream (via ``torch.cuda.ExternalStream``) — without that binding,
+    torch ops would queue on torch's default stream and race with cupy
+    writes through the merge buffer.
+    """
+
+    _BLOCK = (16, 16, 1)
+
+    def __init__(
+        self,
+        token_bank_host,
+        section_offsets_host,
+        stripe_start_section,
+        stripe_end_section,
+        num_neighbors,
+        query_tile_sections,
+        candidate_tile_sections,
+        log_prefix,
+    ):
+        import cupy
+        import torch
+
+        self.token_bank_host = token_bank_host
+        self.section_offsets_host = section_offsets_host
+        self.stripe_start_section = stripe_start_section
+        self.stripe_end_section = stripe_end_section
+        self.stripe_size = stripe_end_section - stripe_start_section
+        self.num_neighbors = num_neighbors
+        self.query_tile_sections = query_tile_sections
+        self.candidate_tile_sections = candidate_tile_sections
+        self.log_prefix = log_prefix
+        self.keep = num_neighbors + 1
+
+        self.total_sections = section_offsets_host.shape[0] - 1
+        self.dimensions = token_bank_host.shape[1]
+
+        # Resident query-stripe token bank on GPU.
+        query_token_start = int(section_offsets_host[stripe_start_section])
+        query_token_end = int(section_offsets_host[stripe_end_section])
+        self.query_tokens_device = cupy.asarray(
+            token_bank_host[query_token_start:query_token_end]
+        )
+        # Per-stripe local section offsets, zeroed against query_token_start.
+        self.query_section_offsets_local = (
+            section_offsets_host[stripe_start_section : stripe_end_section + 1]
+            - query_token_start
+        ).astype(np.int32)
+        self.query_section_offsets_device = cupy.asarray(
+            self.query_section_offsets_local
+        )
+
+        self.segment_max_kernel, self.segment_sum_kernel = _segment_kernels()
+
+        self.candidate_starts = list(
+            range(0, self.total_sections, candidate_tile_sections)
+        )
+        max_tile_tokens = self._scan_max_tile_tokens()
+        max_query_tokens_per_tile = self._scan_max_query_tokens()
+
+        # Pinned host scratch + resident device buffers for candidate tiles.
+        self.pinned_holders: list = []
+        self.pinned_views: list[np.ndarray] = []
+        for _ in range(2):
+            pinned = cupy.cuda.alloc_pinned_memory(
+                max_tile_tokens * self.dimensions * 2
+            )
+            self.pinned_holders.append(pinned)
+            view = np.frombuffer(
+                pinned, dtype=np.float16, count=max_tile_tokens * self.dimensions
+            ).reshape(max_tile_tokens, self.dimensions)
+            self.pinned_views.append(view)
+        self.doc_token_buffers = [
+            cupy.empty((max_tile_tokens, self.dimensions), dtype=cupy.float16),
+            cupy.empty((max_tile_tokens, self.dimensions), dtype=cupy.float16),
+        ]
+        self.doc_offsets_buffers = [
+            cupy.empty((candidate_tile_sections + 1,), dtype=cupy.int32),
+            cupy.empty((candidate_tile_sections + 1,), dtype=cupy.int32),
+        ]
+
+        # Pre-allocated FP32 scratch for the inner loop.
+        self.sim_buffer = cupy.empty(
+            (max_query_tokens_per_tile, max_tile_tokens), dtype=cupy.float32
+        )
+        self.per_token_max = cupy.empty(
+            (max_query_tokens_per_tile, candidate_tile_sections), dtype=cupy.float32
+        )
+        self.score_out = cupy.empty(
+            (query_tile_sections, candidate_tile_sections), dtype=cupy.float32
+        )
+
+        self.topk_scores = cupy.full(
+            (self.stripe_size, self.keep), -cupy.inf, dtype=cupy.float32
+        )
+        self.topk_indices = cupy.full(
+            (self.stripe_size, self.keep), -1, dtype=cupy.int32
+        )
+
+        # Pre-allocated merge scratch — eliminates allocator churn in the
+        # hot loop. (Q, 2*keep) is small but called per microbatch.
+        self.combined_scores = cupy.empty(
+            (query_tile_sections, 2 * self.keep), dtype=cupy.float32
+        )
+        self.combined_indices = cupy.empty(
+            (query_tile_sections, 2 * self.keep), dtype=cupy.int32
+        )
+        self.tile_values_t = torch.empty(
+            (query_tile_sections, self.keep), dtype=torch.float32, device="cuda"
+        )
+        self.tile_local_t = torch.empty(
+            (query_tile_sections, self.keep), dtype=torch.int64, device="cuda"
+        )
+        self.merge_pos_t = torch.empty(
+            (query_tile_sections, self.keep), dtype=torch.int64, device="cuda"
+        )
+        # DLPack-wrap pre-allocated cupy buffers as torch views *once*:
+        # re-wrapping per-iter trips torch's DLPack-consume guard on some
+        # versions and surfaces as cudaErrorIllegalAddress later.
+        self.combined_scores_t = torch.from_dlpack(self.combined_scores)
+        self.combined_indices_t = torch.from_dlpack(self.combined_indices)
+        self.topk_scores_t = torch.from_dlpack(self.topk_scores)
+        self.topk_indices_t = torch.from_dlpack(self.topk_indices)
+
+        self.copy_stream = cupy.cuda.Stream(non_blocking=True)
+        self.compute_stream = cupy.cuda.Stream(non_blocking=True)
+        self.copy_done = [cupy.cuda.Event(disable_timing=True) for _ in range(2)]
+        self.compute_done = [cupy.cuda.Event(disable_timing=True) for _ in range(2)]
+        self.torch_compute_stream = torch.cuda.ExternalStream(self.compute_stream.ptr)
+
+    def _scan_max_tile_tokens(self) -> int:
+        max_tile_tokens = 0
+        for candidate_start in self.candidate_starts:
+            candidate_end = min(
+                candidate_start + self.candidate_tile_sections, self.total_sections
+            )
+            tile_tokens = int(
+                self.section_offsets_host[candidate_end]
+                - self.section_offsets_host[candidate_start]
+            )
+            if tile_tokens > max_tile_tokens:
+                max_tile_tokens = tile_tokens
+        return max_tile_tokens
+
+    def _scan_max_query_tokens(self) -> int:
+        # True upper bound on query-token count for any sliding window of
+        # `query_tile_sections` sections within the stripe. The corpus has
+        # outlier sections (max ~1000 tokens) so a coarse heuristic is unsafe.
+        if self.stripe_size <= self.query_tile_sections:
+            return int(
+                self.section_offsets_host[self.stripe_end_section]
+                - self.section_offsets_host[self.stripe_start_section]
+            )
+        starts = np.arange(
+            self.stripe_start_section,
+            self.stripe_end_section - self.query_tile_sections + 1,
+        )
+        ends = starts + self.query_tile_sections
+        window_tokens = (
+            self.section_offsets_host[ends] - self.section_offsets_host[starts]
+        )
+        return int(window_tokens.max())
+
+    def _stage_tile(self, slot: int, candidate_start: int) -> tuple[int, int]:
+        candidate_end = min(
+            candidate_start + self.candidate_tile_sections, self.total_sections
+        )
+        section_count = candidate_end - candidate_start
+        token_start = int(self.section_offsets_host[candidate_start])
+        token_end = int(self.section_offsets_host[candidate_end])
+        token_count = token_end - token_start
+        self.copy_done[slot].synchronize()
+        np.copyto(
+            self.pinned_views[slot][:token_count],
+            self.token_bank_host[token_start:token_end],
+        )
+        local_offsets = (
+            self.section_offsets_host[candidate_start : candidate_end + 1]
+            - token_start
+        ).astype(np.int32)
+        self.copy_stream.wait_event(self.compute_done[slot])
+        self.doc_token_buffers[slot][:token_count].set(
+            self.pinned_views[slot][:token_count], stream=self.copy_stream
+        )
+        self.doc_offsets_buffers[slot][: section_count + 1].set(
+            local_offsets, stream=self.copy_stream
+        )
+        self.copy_done[slot].record(self.copy_stream)
+        return section_count, token_count
+
+    def _score_microbatch(
+        self,
+        slot: int,
+        section_count: int,
+        token_count: int,
+        candidate_start_i32,
+        query_section_start: int,
+        query_section_end: int,
+    ):
+        import cupy
+        import torch
+
+        query_section_count = query_section_end - query_section_start
+        query_token_start = int(
+            self.query_section_offsets_local[query_section_start]
+        )
+        query_token_end = int(self.query_section_offsets_local[query_section_end])
+        query_token_count = query_token_end - query_token_start
+        if query_token_count == 0:
+            return
+
+        doc_tokens_dev = self.doc_token_buffers[slot][:token_count]
+        doc_offsets_dev = self.doc_offsets_buffers[slot][: section_count + 1]
+        query_tokens_dev = self.query_tokens_device[query_token_start:query_token_end]
+
+        # Step 1 — matmul into the FP32 sim buffer.
+        sim_view = self.sim_buffer[:query_token_count, :token_count]
+        cupy.matmul(query_tokens_dev, doc_tokens_dev.T, out=sim_view)
+
+        # Step 2 — per-(q_token, doc) max over the doc-token segment.
+        per_token_max_view = self.per_token_max[:query_token_count, :section_count]
+        block = self._BLOCK
+        grid_max = (
+            (section_count + block[0] - 1) // block[0],
+            (query_token_count + block[1] - 1) // block[1],
+            1,
+        )
+        self.segment_max_kernel(
+            grid_max,
+            block,
+            (
+                sim_view,
+                doc_offsets_dev,
+                per_token_max_view,
+                np.int32(query_token_count),
+                np.int32(section_count),
+                np.int32(self.sim_buffer.shape[1]),
+                np.int32(self.per_token_max.shape[1]),
+            ),
+        )
+
+        # Step 3 — sum over query tokens within each query section.
+        score_view = self.score_out[:query_section_count, :section_count]
+        grid_sum = (
+            (section_count + block[0] - 1) // block[0],
+            (query_section_count + block[1] - 1) // block[1],
+            1,
+        )
+        self.segment_sum_kernel(
+            grid_sum,
+            block,
+            (
+                per_token_max_view,
+                # Stripe-relative offsets passed unchanged; the kernel
+                # subtracts `offset_base` (the microbatch's first query
+                # token) per call.
+                self.query_section_offsets_device[
+                    query_section_start : query_section_end + 1
+                ],
+                score_view,
+                np.int32(query_section_count),
+                np.int32(section_count),
+                np.int32(self.per_token_max.shape[1]),
+                np.int32(self.score_out.shape[1]),
+                np.int32(query_token_start),
+            ),
+        )
+
+        # Step 4 — top-k of (running ∪ tile) into the running buffer.
+        score_view_t = torch.from_dlpack(score_view)
+        self._merge_running_topk(
+            section_count=section_count,
+            candidate_start_i32=candidate_start_i32,
+            query_section_start=query_section_start,
+            query_section_end=query_section_end,
+            query_section_count=query_section_count,
+            score_view_t=score_view_t,
+        )
+
+    def _merge_running_topk(
+        self,
+        section_count: int,
+        candidate_start_i32,
+        query_section_start: int,
+        query_section_end: int,
+        query_section_count: int,
+        score_view_t,
+    ):
+        """Pre-allocated 2-way top-k merge: stage running + tile values
+        side-by-side into the combined buffer, then top-k + gather directly
+        into the running buffer.
+        """
+        import cupy
+        import torch
+
+        keep = self.keep
+        running_scores = self.topk_scores_t[query_section_start:query_section_end]
+        running_indices = self.topk_indices_t[query_section_start:query_section_end]
+
+        if section_count >= keep:
+            torch.topk(
+                score_view_t,
+                k=keep,
+                dim=1,
+                largest=True,
+                sorted=False,
+                out=(
+                    self.tile_values_t[:query_section_count],
+                    self.tile_local_t[:query_section_count],
+                ),
+            )
+            self.combined_scores_t[:query_section_count, :keep].copy_(running_scores)
+            self.combined_scores_t[:query_section_count, keep:].copy_(
+                self.tile_values_t[:query_section_count]
+            )
+            self.combined_indices_t[:query_section_count, :keep].copy_(running_indices)
+            # Tile-local int64 → int32, lift to global by adding tile offset.
+            self.combined_indices[:query_section_count, keep:] = (
+                cupy.from_dlpack(self.tile_local_t[:query_section_count]).astype(
+                    cupy.int32
+                )
+                + candidate_start_i32
+            )
+        else:
+            # Tile narrower than keep: pad scores with -inf, indices with -1.
+            self.combined_scores_t[:query_section_count, :keep].copy_(running_scores)
+            self.combined_scores_t[
+                :query_section_count, keep : keep + section_count
+            ].copy_(score_view_t)
+            self.combined_scores_t[
+                :query_section_count, keep + section_count :
+            ].fill_(float("-inf"))
+            self.combined_indices_t[:query_section_count, :keep].copy_(running_indices)
+            self.combined_indices[
+                :query_section_count, keep : keep + section_count
+            ] = cupy.arange(section_count, dtype=cupy.int32) + candidate_start_i32
+            self.combined_indices_t[
+                :query_section_count, keep + section_count :
+            ].fill_(-1)
+
+        # Final merge: top-k of (running ∪ tile). Scores write directly into
+        # the running buffer; indices via torch.gather (int64 index).
+        torch.topk(
+            self.combined_scores_t[:query_section_count],
+            k=keep,
+            dim=1,
+            largest=True,
+            sorted=False,
+            out=(running_scores, self.merge_pos_t[:query_section_count]),
+        )
+        torch.gather(
+            self.combined_indices_t[:query_section_count],
+            1,
+            self.merge_pos_t[:query_section_count],
+            out=running_indices,
+        )
+
+    def _maybe_log_progress(self, tile_idx: int, started: float):
+        import cupy
+
+        last = tile_idx + 1 == len(self.candidate_starts)
+        if (tile_idx + 1) % 32 != 0 and not last:
+            return
+        self.compute_stream.synchronize()
+        cupy.get_default_memory_pool().free_all_blocks()
+        elapsed = time.monotonic() - started
+        done = (tile_idx + 1) * self.candidate_tile_sections
+        rate = done / max(elapsed, 1e-3) / 1e6
+        print(
+            f"{self.log_prefix}tile {tile_idx + 1}/{len(self.candidate_starts)} "
+            f"elapsed {elapsed:.0f}s ({rate:.2f}M sect/s)",
+            flush=True,
+        )
+
+    def _finalize(self) -> tuple[np.ndarray, np.ndarray]:
+        import cupy
+
+        sorted_order = cupy.argsort(-self.topk_scores, axis=1)
+        sorted_scores = cupy.take_along_axis(self.topk_scores, sorted_order, axis=1)
+        sorted_indices = cupy.take_along_axis(self.topk_indices, sorted_order, axis=1)
+        query_global_ids = cupy.arange(
+            self.stripe_start_section, self.stripe_end_section, dtype=cupy.int32
+        )
+        final_indices, final_scores = _drop_self_match(
+            sorted_scores, sorted_indices, query_global_ids, self.num_neighbors
+        )
+        return cupy.asnumpy(final_indices), cupy.asnumpy(final_scores)
+
+    def run(self) -> tuple[np.ndarray, np.ndarray]:
+        import torch
+
+        counts = [(0, 0), (0, 0)]
+        for slot in range(min(2, len(self.candidate_starts))):
+            counts[slot] = self._stage_tile(slot, self.candidate_starts[slot])
+
+        started = time.monotonic()
+        for tile_idx, candidate_start in enumerate(self.candidate_starts):
+            slot = tile_idx % 2
+            section_count, token_count = counts[slot]
+            if section_count == 0:
+                continue
+            self.compute_stream.wait_event(self.copy_done[slot])
+            candidate_start_i32 = np.int32(candidate_start)
+
+            with self.compute_stream, torch.cuda.stream(self.torch_compute_stream):
+                for query_section_start in range(
+                    0, self.stripe_size, self.query_tile_sections
+                ):
+                    query_section_end = min(
+                        query_section_start + self.query_tile_sections,
+                        self.stripe_size,
+                    )
+                    self._score_microbatch(
+                        slot,
+                        section_count,
+                        token_count,
+                        candidate_start_i32,
+                        query_section_start,
+                        query_section_end,
+                    )
+                self.compute_done[slot].record(self.compute_stream)
+
+            prefetch_idx = tile_idx + 2
+            if prefetch_idx < len(self.candidate_starts):
+                counts[slot] = self._stage_tile(
+                    slot, self.candidate_starts[prefetch_idx]
+                )
+
+            self._maybe_log_progress(tile_idx, started)
+
+        self.compute_stream.synchronize()
+        return self._finalize()
 
 
 def gt_stripe_maxsim(
@@ -316,313 +953,50 @@ def gt_stripe_maxsim(
     query_tile_sections: int,
     candidate_tile_sections: int,
     log_prefix: str = "",
-):
-    """Compute MaxSim top-k for sections in
-    `[stripe_start_section, stripe_end_section)` against the whole section
-    corpus. Returns `(indices, scores)` numpy arrays of shape
-    `(stripe_size, num_neighbors)`.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute exact MaxSim top-k for sections in
+    ``[stripe_start_section, stripe_end_section)`` against the whole section
+    corpus. Returns ``(indices, scores)`` numpy arrays of shape
+    ``(stripe_size, num_neighbors)``.
 
-    `token_bank_host` is `(T_total, dim)` FP16; `section_offsets_host` is
-    `(N+1,)` int32 with cumulative token counts (so section i's tokens live
-    at rows `[offsets[i]:offsets[i+1]]`).
+    ``token_bank_host`` is ``(T_total, dim)`` FP16; ``section_offsets_host``
+    is ``(N+1,)`` int32 cumulative (section i's tokens live at rows
+    ``[offsets[i] : offsets[i+1]]``).
+
+    Caller picks the GPU via ``CUDA_VISIBLE_DEVICES``.
     """
-    import cupy
-    import torch  # noqa: F401
-
-    total_sections = section_offsets_host.shape[0] - 1
-    dimensions = token_bank_host.shape[1]
-    stripe_size = stripe_end_section - stripe_start_section
-    keep = num_neighbors + 1
-
-    query_token_start = int(section_offsets_host[stripe_start_section])
-    query_token_end = int(section_offsets_host[stripe_end_section])
-    query_token_count = query_token_end - query_token_start
-    query_tokens_device = cupy.asarray(token_bank_host[query_token_start:query_token_end])
-    # Per-stripe local section offsets (zeroed against query_token_start).
-    query_section_offsets_local = (
-        section_offsets_host[stripe_start_section : stripe_end_section + 1]
-        - query_token_start
-    ).astype(np.int32)
-    query_section_offsets_device = cupy.asarray(query_section_offsets_local)
-
-    seg_max_kernel, seg_sum_kernel = _segment_kernels()
-
-    candidate_starts = list(range(0, total_sections, candidate_tile_sections))
-
-    # Pre-compute per-tile token byte budget so we can size pinned buffers.
-    max_tile_tokens = 0
-    for cand_start in candidate_starts:
-        cand_end = min(cand_start + candidate_tile_sections, total_sections)
-        tile_tokens = int(
-            section_offsets_host[cand_end] - section_offsets_host[cand_start]
-        )
-        if tile_tokens > max_tile_tokens:
-            max_tile_tokens = tile_tokens
-
-    pinned_holders = []
-    pinned_views: list[np.ndarray] = []
-    for _ in range(2):
-        pinned = cupy.cuda.alloc_pinned_memory(max_tile_tokens * dimensions * 2)
-        pinned_holders.append(pinned)
-        view = np.frombuffer(
-            pinned, dtype=np.float16, count=max_tile_tokens * dimensions
-        ).reshape(max_tile_tokens, dimensions)
-        pinned_views.append(view)
-
-    doc_token_buffers = [
-        cupy.empty((max_tile_tokens, dimensions), dtype=cupy.float16),
-        cupy.empty((max_tile_tokens, dimensions), dtype=cupy.float16),
-    ]
-    doc_offsets_buffers = [
-        cupy.empty((candidate_tile_sections + 1,), dtype=cupy.int32),
-        cupy.empty((candidate_tile_sections + 1,), dtype=cupy.int32),
-    ]
-
-    # Pre-allocated FP32 scratch buffers reused across tiles.
-    sim_buffer = cupy.empty(
-        (query_tile_sections * 64, max_tile_tokens), dtype=cupy.float32
-    )
-    # Bound on per-stripe query tokens per tile is `max query tokens` over the
-    # query stripe. A safe upper bound for the buffer is the full stripe's
-    # token count, but we tile queries by section count too — so size
-    # generously to avoid mid-loop re-allocs.
-    max_query_tokens_per_tile = int(
-        max(
-            section_offsets_host[
-                min(stripe_start_section + query_tile_sections, stripe_end_section)
-            ]
-            - section_offsets_host[stripe_start_section],
-            section_offsets_host[stripe_end_section]
-            - section_offsets_host[
-                max(stripe_end_section - query_tile_sections, stripe_start_section)
-            ],
-        )
-    )
-    # Re-size sim_buffer if it's too small for the worst-case (q_tokens, m_tokens).
-    if sim_buffer.shape[0] < max_query_tokens_per_tile:
-        sim_buffer = cupy.empty(
-            (max_query_tokens_per_tile, max_tile_tokens), dtype=cupy.float32
-        )
-    per_token_max = cupy.empty(
-        (max_query_tokens_per_tile, candidate_tile_sections), dtype=cupy.float32
-    )
-    score_out = cupy.empty(
-        (query_tile_sections, candidate_tile_sections), dtype=cupy.float32
-    )
-
-    topk_scores = cupy.full((stripe_size, keep), -cupy.inf, dtype=cupy.float32)
-    topk_indices = cupy.full((stripe_size, keep), -1, dtype=cupy.int32)
-
-    copy_stream = cupy.cuda.Stream(non_blocking=True)
-    compute_stream = cupy.cuda.Stream(non_blocking=True)
-    copy_done = [
-        cupy.cuda.Event(disable_timing=True),
-        cupy.cuda.Event(disable_timing=True),
-    ]
-    compute_done = [
-        cupy.cuda.Event(disable_timing=True),
-        cupy.cuda.Event(disable_timing=True),
-    ]
-
-    def stage(slot: int, cand_start: int):
-        cand_end = min(cand_start + candidate_tile_sections, total_sections)
-        section_count = cand_end - cand_start
-        token_start = int(section_offsets_host[cand_start])
-        token_end = int(section_offsets_host[cand_end])
-        token_count = token_end - token_start
-        copy_done[slot].synchronize()
-        np.copyto(
-            pinned_views[slot][:token_count],
-            token_bank_host[token_start:token_end],
-        )
-        # Local doc offsets, zeroed against token_start.
-        local_offsets = (
-            section_offsets_host[cand_start : cand_end + 1] - token_start
-        ).astype(np.int32)
-        copy_stream.wait_event(compute_done[slot])
-        doc_token_buffers[slot][:token_count].set(
-            pinned_views[slot][:token_count], stream=copy_stream
-        )
-        doc_offsets_buffers[slot][: section_count + 1].set(
-            local_offsets, stream=copy_stream
-        )
-        copy_done[slot].record(copy_stream)
-        return section_count, token_count
-
-    counts = [(0, 0), (0, 0)]
-    for slot in range(min(2, len(candidate_starts))):
-        counts[slot] = stage(slot, candidate_starts[slot])
-
-    block = (16, 16, 1)
-    started = time.monotonic()
-
-    for tile_idx, cand_start in enumerate(candidate_starts):
-        slot = tile_idx % 2
-        section_count, token_count = counts[slot]
-        if section_count == 0:
-            continue
-        compute_stream.wait_event(copy_done[slot])
-
-        doc_tokens_dev = doc_token_buffers[slot][:token_count]
-        doc_offsets_dev = doc_offsets_buffers[slot][: section_count + 1]
-
-        with compute_stream:
-            for q_section_start in range(0, stripe_size, query_tile_sections):
-                q_section_end = min(q_section_start + query_tile_sections, stripe_size)
-                q_count = q_section_end - q_section_start
-                q_token_lo = int(query_section_offsets_local[q_section_start])
-                q_token_hi = int(query_section_offsets_local[q_section_end])
-                q_token_count = q_token_hi - q_token_lo
-                if q_token_count == 0:
-                    continue
-                q_tokens_dev = query_tokens_device[q_token_lo:q_token_hi]
-                # Local query offsets for this micro-batch (zeroed against q_token_lo).
-                q_offsets_micro = (
-                    query_section_offsets_device[q_section_start : q_section_end + 1]
-                    - cupy.int32(q_token_lo)
-                )
-
-                sim_view = sim_buffer[:q_token_count, :token_count]
-                cupy.matmul(q_tokens_dev, doc_tokens_dev.T, out=sim_view)
-
-                pt_max_view = per_token_max[:q_token_count, :section_count]
-                grid_max = (
-                    (section_count + block[0] - 1) // block[0],
-                    (q_token_count + block[1] - 1) // block[1],
-                    1,
-                )
-                seg_max_kernel(
-                    grid_max,
-                    block,
-                    (
-                        sim_view,
-                        doc_offsets_dev,
-                        pt_max_view,
-                        np.int32(q_token_count),
-                        np.int32(section_count),
-                        np.int32(sim_buffer.shape[1]),
-                        np.int32(per_token_max.shape[1]),
-                    ),
-                )
-
-                score_view = score_out[:q_count, :section_count]
-                grid_sum = (
-                    (section_count + block[0] - 1) // block[0],
-                    (q_count + block[1] - 1) // block[1],
-                    1,
-                )
-                seg_sum_kernel(
-                    grid_sum,
-                    block,
-                    (
-                        pt_max_view,
-                        q_offsets_micro,
-                        score_view,
-                        np.int32(q_count),
-                        np.int32(section_count),
-                        np.int32(per_token_max.shape[1]),
-                        np.int32(score_out.shape[1]),
-                    ),
-                )
-
-                tile_scores, tile_indices = _tile_topk_dense(
-                    score_view, keep, cand_start, q_count, section_count
-                )
-                new_scores, new_indices = _topk_merge(
-                    topk_scores[q_section_start:q_section_end],
-                    topk_indices[q_section_start:q_section_end],
-                    tile_scores,
-                    tile_indices,
-                    keep,
-                )
-                topk_scores[q_section_start:q_section_end] = new_scores
-                topk_indices[q_section_start:q_section_end] = new_indices
-            compute_done[slot].record(compute_stream)
-
-        prefetch_idx = tile_idx + 2
-        if prefetch_idx < len(candidate_starts):
-            counts[slot] = stage(slot, candidate_starts[prefetch_idx])
-
-        if (tile_idx + 1) % 32 == 0 or tile_idx + 1 == len(candidate_starts):
-            compute_stream.synchronize()
-            cupy.get_default_memory_pool().free_all_blocks()
-            elapsed = time.monotonic() - started
-            done = (tile_idx + 1) * candidate_tile_sections
-            rate = done / max(elapsed, 1e-3) / 1e6
-            print(
-                f"{log_prefix}tile {tile_idx + 1}/{len(candidate_starts)} "
-                f"elapsed {elapsed:.0f}s ({rate:.2f}M sect/s)",
-                flush=True,
-            )
-
-    compute_stream.synchronize()
-
-    sorted_order = cupy.argsort(-topk_scores, axis=1)
-    sorted_scores = cupy.take_along_axis(topk_scores, sorted_order, axis=1)
-    sorted_indices = cupy.take_along_axis(topk_indices, sorted_order, axis=1)
-    query_global_ids = cupy.arange(
-        stripe_start_section, stripe_end_section, dtype=cupy.int32
-    )
-    final_indices, final_scores = _drop_self(
-        sorted_scores, sorted_indices, query_global_ids, num_neighbors
-    )
-    return cupy.asnumpy(final_indices), cupy.asnumpy(final_scores)
+    return _MaxSimStripeRunner(
+        token_bank_host,
+        section_offsets_host,
+        stripe_start_section,
+        stripe_end_section,
+        num_neighbors,
+        query_tile_sections,
+        candidate_tile_sections,
+        log_prefix,
+    ).run()
 
 
-# ---------------------------------------------------------------------------
-# Consumer-facing classes: load corpus once, search many.
-# ---------------------------------------------------------------------------
-
-
-def _read_header(path: Path) -> tuple[int, int]:
-    blob = resolve_lfs_pointer(path)
-    with open(blob, "rb") as file:
-        rows, columns = struct.unpack("<II", file.read(8))
-    return rows, columns
-
-
-def _load_dense_corpus_to_host(
-    model_root: Path, suffix: str, shards: list[CollectionShard]
-) -> tuple[np.ndarray, int]:
-    """Same data-load contract as `ground_truth.load_collection` but kept here
-    so `DenseRetriever` doesn't need to import the GT script.
-    """
-    if not shards:
-        raise ValueError(f"no shards under {model_root}")
-    _, dimensions = _read_header(shards[0].path)
-    total = sum(s.row_count for s in shards)
-    embeddings = np.empty((total, dimensions), dtype=np.float16)
-    for shard in shards:
-        blob = resolve_lfs_pointer(shard.path)
-        with open(blob, "rb") as file:
-            file.seek(8)
-            destination = embeddings[shard.row_offset : shard.row_offset + shard.row_count]
-            file.readinto(memoryview(destination))  # type: ignore[arg-type]
-    bad = ~np.isfinite(embeddings).all(axis=1)
-    if bad.any():
-        embeddings[bad] = 0
-    return embeddings, dimensions
-
-
-def _load_maxsim_corpus_to_host(
+def load_maxsim_corpus(
     model_root: Path, suffix: str
 ) -> tuple[np.ndarray, np.ndarray, list[CollectionShard], int]:
-    """Walk `*.{suffix}.sections.f16bin` + `*.sections.offsets.ibin` shards in
-    canonical order. Return `(token_bank, section_offsets, shards, dimensions)`.
+    """Walk ``*.{suffix}.sections.f16bin`` + ``*.sections.offsets.ibin``
+    shards in canonical order. Returns
+    ``(token_bank, section_offsets, shards, dimensions)``.
 
-    `section_offsets` has shape `(total_sections + 1,)` int32 cumulative across
-    all shards (so section i's tokens are at `token_bank[offsets[i]:offsets[i+1]]`).
-    Each `CollectionShard.row_count` is the number of *sections* in that shard,
-    `row_offset` is the cumulative section count.
+    ``section_offsets`` has shape ``(total_sections + 1,)`` int32 cumulative
+    across all shards (section i's tokens live at
+    ``token_bank[offsets[i] : offsets[i+1]]``). Each ``CollectionShard``'s
+    ``row_count`` is its section count, ``row_offset`` the cumulative
+    section count.
     """
     if not model_root.is_dir():
         raise FileNotFoundError(f"no model directory at {model_root}")
     shards: list[CollectionShard] = []
     cumulative_sections = 0
     cumulative_tokens = 0
-    section_offsets_chunks: list[np.ndarray] = []
-    section_offsets_chunks.append(np.zeros(1, dtype=np.int32))
-    token_chunks: list[tuple[int, int, Path]] = []  # (offset_in_bank, token_count, path)
+    section_offsets_chunks: list[np.ndarray] = [np.zeros(1, dtype=np.int32)]
+    token_chunks: list[tuple[int, int, Path]] = []
     dimensions: int | None = None
     for wiki_dir in sorted(model_root.iterdir()):
         if not wiki_dir.is_dir():
@@ -645,7 +1019,7 @@ def _load_maxsim_corpus_to_host(
                 ).copy()
             n_sections = rows - 1
             shifted = (local_offsets + cumulative_tokens).astype(np.int32)
-            # `local_offsets` already starts at 0; we drop the first element of
+            # Local offsets already start at 0; drop the first element of
             # subsequent chunks since `cumulative_tokens` provides the seam.
             section_offsets_chunks.append(shifted[1:])
             shards.append(
@@ -661,7 +1035,9 @@ def _load_maxsim_corpus_to_host(
             cumulative_sections += n_sections
             cumulative_tokens += tokens
     if dimensions is None:
-        raise FileNotFoundError(f"no `.{suffix}.sections.f16bin` files under {model_root}")
+        raise FileNotFoundError(
+            f"no `.{suffix}.sections.f16bin` files under {model_root}"
+        )
 
     token_bank = np.empty((cumulative_tokens, dimensions), dtype=np.float16)
     for token_offset, token_count, path in token_chunks:
@@ -677,74 +1053,17 @@ def _load_maxsim_corpus_to_host(
     return token_bank, section_offsets, shards, dimensions
 
 
-class DenseRetriever:
-    """Brute-force exact cosine top-k for a dense embedding collection.
-
-    Loads the entire `(N, dim)` FP16 corpus to one GPU at construction. Each
-    `search()` call runs a single matmul + top-k against that resident corpus.
-
-    For 60M × 1024 FP16 (~120 GB) the corpus does NOT fit on a single 80 GB
-    H100 — quantize on-disk before instantiating, or use the multi-GPU
-    `gt_stripe_dense` path directly. The single-resident-corpus class is
-    designed for moderate-size collections (≤ tens of GB).
-    """
-
-    def __init__(
-        self,
-        model_root: str | Path,
-        suffix: str = "body",
-        device_id: int = 0,
-    ):
-        import os
-
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-        import cupy
-
-        model_root = Path(model_root)
-        self.model_root = model_root
-        self.suffix = suffix
-        self.shards = discover_collection(model_root, suffix)
-        embeddings_host, self.dimensions = _load_dense_corpus_to_host(
-            model_root, suffix, self.shards
-        )
-        self.total_vectors = embeddings_host.shape[0]
-        # Resident on GPU — caller pays the upfront cost; subsequent searches
-        # are bandwidth-bound on the matmul alone.
-        self.corpus_device = cupy.asarray(embeddings_host)
-
-    def search(
-        self, query_vectors: np.ndarray, k: int = 10
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """`query_vectors`: `(Q, dim)` FP16, already L2-normalized.
-        Returns `(scores, indices)` — both `(Q, k)` numpy arrays.
-        """
-        import cupy
-        import torch  # noqa: F401
-
-        if query_vectors.ndim != 2 or query_vectors.shape[1] != self.dimensions:
-            raise ValueError(
-                f"queries shape {query_vectors.shape} != (?, {self.dimensions})"
-            )
-        queries_dev = cupy.asarray(query_vectors.astype(np.float16, copy=False))
-        sim = cupy.matmul(queries_dev, self.corpus_device.T, dtype=cupy.float32)
-        sim_torch = torch.from_dlpack(sim)
-        values, local = torch.topk(sim_torch, k=k, dim=1, largest=True, sorted=True)
-        return cupy.asnumpy(cupy.from_dlpack(values)), cupy.asnumpy(
-            cupy.from_dlpack(local).astype(cupy.int32)
-        )
-
-
 class MaxSimRetriever:
     """Brute-force exact MaxSim top-k for a multi-vector section corpus.
 
     Loads the full token bank + section offsets to one GPU at construction.
-    `search()` accepts a query in the same `(token_bank, offsets)` shape and
-    runs matmul + segment-max + segment-sum + top-k against the resident
-    corpus.
+    ``search()`` accepts a query in the same ``(token_bank, offsets)``
+    shape and runs matmul + segment-max + segment-sum + top-k against the
+    resident corpus.
 
-    For 60 M sections × 128 dim with average 3.4 tokens/section the resident
-    bank is ~52 GB FP16 — fits on H100 with margin only after FP8/int8
-    quantization, or on B200 / multi-GPU for raw FP16.
+    For 60M sections × 128 dim (avg 3.4 tokens/section) the resident bank
+    is ~52 GB FP16 — fits on H100 only after FP8/int8 quantization, or on
+    B200 / multi-GPU for raw FP16.
     """
 
     def __init__(
@@ -766,7 +1085,7 @@ class MaxSimRetriever:
             section_offsets_host,
             self.shards,
             self.dimensions,
-        ) = _load_maxsim_corpus_to_host(model_root, suffix)
+        ) = load_maxsim_corpus(model_root, suffix)
         self.total_sections = section_offsets_host.shape[0] - 1
         self.total_tokens = token_bank_host.shape[0]
         self.token_bank_device = cupy.asarray(token_bank_host)
@@ -778,18 +1097,19 @@ class MaxSimRetriever:
         query_section_offsets: np.ndarray,
         k: int = 10,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """`query_token_bank`: `(T_q, dim)` FP16. `query_section_offsets`:
-        `(Q+1,)` int32 cumulative. Returns `(scores, indices)` — `(Q, k)`.
+        """``query_token_bank``: ``(T_q, dim)`` FP16. ``query_section_offsets``:
+        ``(Q+1,)`` int32 cumulative. Returns ``(scores, indices)`` —
+        both ``(Q, k)`` numpy arrays.
         """
         import cupy
-        import torch  # noqa: F401
+        import torch
 
         if query_token_bank.ndim != 2 or query_token_bank.shape[1] != self.dimensions:
             raise ValueError(
                 f"queries shape {query_token_bank.shape} != (?, {self.dimensions})"
             )
         n_queries = query_section_offsets.shape[0] - 1
-        seg_max_kernel, seg_sum_kernel = _segment_kernels()
+        segment_max_kernel, segment_sum_kernel = _segment_kernels()
 
         queries_dev = cupy.asarray(query_token_bank.astype(np.float16, copy=False))
         q_offsets_dev = cupy.asarray(query_section_offsets.astype(np.int32, copy=False))
@@ -804,7 +1124,7 @@ class MaxSimRetriever:
             (queries_dev.shape[0] + block[1] - 1) // block[1],
             1,
         )
-        seg_max_kernel(
+        segment_max_kernel(
             grid_max,
             block,
             (
@@ -824,7 +1144,7 @@ class MaxSimRetriever:
             (n_queries + block[1] - 1) // block[1],
             1,
         )
-        seg_sum_kernel(
+        segment_sum_kernel(
             grid_sum,
             block,
             (
@@ -843,3 +1163,6 @@ class MaxSimRetriever:
         return cupy.asnumpy(cupy.from_dlpack(values)), cupy.asnumpy(
             cupy.from_dlpack(local).astype(cupy.int32)
         )
+
+
+# endregion

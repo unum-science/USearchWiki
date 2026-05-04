@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from retrievers import (  # noqa: E402
-    _load_maxsim_corpus_to_host,
+    load_maxsim_corpus,
     gt_stripe_dense,
     gt_stripe_maxsim,
 )
@@ -311,7 +311,7 @@ def run_dense(args, model_root: Path) -> None:
 def run_maxsim(args, model_root: Path) -> None:
     started = time.monotonic()
     print(f"loading multi-vector corpus under {model_root} ...", flush=True)
-    token_bank, section_offsets, shards, dimensions = _load_maxsim_corpus_to_host(
+    token_bank, section_offsets, shards, dimensions = load_maxsim_corpus(
         model_root, args.output_suffix
     )
     elapsed = time.monotonic() - started
