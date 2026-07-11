@@ -143,6 +143,149 @@ Average article length across all languages is ~400 tokens, but this is dragged 
 | nomic-embed-text-v1.5                | 1200 doc/s |         21 B |  0.6 d |  61.6 M |   95 GB | Truncated at 8K tokens                |
 | e5-mistral-7b-instruct               |   50 doc/s |         21 B | 14.3 d |  61.6 M |  505 GB | Truncated at 4K tokens                |
 
+> Single H100 80 GB, full dataset — 61.6M articles, all 325 languages.
+
+## Enrichment
+
+WikiVerse goes beyond embeddings.
+Wikipedia articles contain rich structure — hyperlinks with descriptive anchor text, section hierarchies, tables, cross-lingual alignments, disambiguation — that can be parsed directly from the wikitext markup without any model inference.
+Combined with Wikidata properties and model-generated QA pairs, this creates __multiple independent notions of relevance__ for the same corpus.
+
+### 1. Anchor text as natural queries (parsed, highest impact)
+
+Wikipedia's internal links carry __anchor text__ that describes the target article in context.
+FineWiki preserves the raw wikitext alongside cleaned text, so every `[[target|anchor]]` link is extractable:
+
+```
+Wikitext:  ...played [[football (soccer)|football]] between the [[Home Nations]]...
+Extracted: "football"                → [[Football (soccer)]]
+           "Home Nations"            → [[Home Nations]]
+           "England"                 → [[England national football team]]
+           "tour of Central Europe"  → [[1907–08 in English football#National team]]
+```
+
+Each anchor is a natural short query for which the target article is ground truth.
+English Wikipedia has __~200M internal links__ — this creates millions of _(query, relevant\_document)_ pairs for free, far more realistic than synthetic queries or self-recall.
+Different articles link to the same target with different anchors, capturing diverse search intents for the same document.
+
+__What it enables:__
+Retrieval benchmarks where the query is natural human-written text, not a randomly sampled vector.
+Evaluates whether each embedding model's vector space places the anchor text near the target article.
+
+### 2. Cross-lingual document alignment (parsed, uniquely novel)
+
+Via Wikidata sitelinks, the same concept exists across 2–300 languages.
+The article about "Paris" in English (`Q90`) maps to "パリ" in Japanese, "Париж" in Russian, "巴黎" in Chinese.
+FineWiki provides `wikidata_id` for every article — cross-referencing across language configs is a simple join:
+
+```
+enwiki: { title: "Paris", wikidata_id: "Q90", ... }
+jawiki: { title: "パリ",   wikidata_id: "Q90", ... }
+ruwiki: { title: "Париж", wikidata_id: "Q90", ... }
+```
+
+__What it enables:__
+Cross-lingual retrieval ground truth: given a query in language A, find the correct article in language B.
+Tests whether multilingual embedding models (Qwen3, Arctic) properly align their vector spaces across scripts.
+No existing ANN benchmark tests cross-lingual retrieval at scale.
+
+### 3. Section-level passage hierarchy (parsed)
+
+FineWiki preserves section headings as Markdown `##`/`###`.
+A section heading is a natural query for its content:
+
+```markdown
+## Early life                → biographical passage about childhood
+## Discovery and naming      → how the element was found
+## Economic impact           → financial analysis section
+```
+
+Each article becomes a tree of passages at different granularities — the full article, individual sections, and individual paragraphs.
+The heading itself serves as a query for which the section content is ground truth.
+
+__What it enables:__
+Passage-level retrieval within articles — a more granular task than full-article retrieval.
+Tests whether embedding models capture topic boundaries within long documents.
+
+### 4. Disambiguation as hard negatives (parsed)
+
+Disambiguation pages explicitly list articles sharing names but meaning different things.
+From wikitext: `[[Mercury (planet)]]`, `[[Mercury (element)]]`, `[[Mercury (mythology)]]`, `[[Freddie Mercury]]`.
+
+These are natural __hard negatives__ — articles that share surface-level query terms but should retrieve different documents.
+Extractable from disambiguation templates in wikitext and from Wikidata `instance_of` divergence.
+
+__What it enables:__
+Precision benchmarks: can the embedding model distinguish "Mercury" the planet from "Mercury" the element when the query is ambiguous?
+Standard ANN benchmarks have no concept of hard negatives.
+
+### 5. Structured metadata for filtered search (parsed + Wikidata)
+
+Wikidata properties and Wikipedia page statistics provide rich, __naturally correlated__ filter attributes.
+Unlike synthetic random labels used in NeurIPS'23, these filters correlate with semantic content — articles about nearby cities cluster both geographically AND in embedding space.
+
+| Attribute           | Type          | Source                   | Example filter                                    |
+| :------------------ | :------------ | :----------------------- | :------------------------------------------------ |
+| `instance_of`       | Categorical   | Wikidata P31             | "only biographies" or "only cities"               |
+| `country`           | Categorical   | Wikidata P17             | "articles about France"                           |
+| `coordinates`       | Geo (lat/lon) | Wikidata P625            | "within 200 km of Tokyo" — ~2M geotagged articles |
+| `inception_year`    | Temporal      | Wikidata P571 / P569     | "events between 1939 and 1945"                    |
+| `population`        | Numeric       | Wikidata P1082           | "cities with population > 500K"                   |
+| `pageviews_monthly` | Numeric       | Wikimedia pageview dumps | "popular articles only (> 10K views)"             |
+| `num_sitelinks`     | Numeric       | Wikidata sitelinks count | "globally notable (exists in 50+ languages)"      |
+| `num_inlinks`       | Numeric       | `pagelinks` SQL dump     | "authoritative (> 1,000 incoming links)"          |
+| `language`          | Categorical   | FineWiki `in_language`   | "only Japanese articles"                          |
+
+__What it enables:__
+Filtered ANN benchmarks with realistic, multi-type filter conjunctions: "French cities founded after 1800 with population > 100K."
+Controllable selectivity: ship query sets at 0.1%, 1%, 10%, 50% selectivity.
+
+### 6. Citation co-occurrence (parsed)
+
+Two articles citing the same external source (URL or DOI in `<ref>` tags) are related in a way distinct from semantic similarity or link structure.
+Articles about the same scientific finding, or different news coverage of the same event, share citations but may not link to each other.
+
+```
+Wikitext:  <ref>{{cite journal|doi=10.1038/nature12373|...}}</ref>
+Extracted: doi:10.1038/nature12373 → shared by articles A, B, C
+```
+
+__What it enables:__
+A "citation graph" orthogonal to the link graph — tests whether embeddings capture source-level relatedness.
+
+### 7. QA pair generation (model-based, standard eval format)
+
+Run a small model (Qwen-2.5-3B) on each article to generate 3–5 factual questions whose answers are in the text.
+The generated question becomes a query, the source article becomes the ground truth document.
+
+```
+Article: "The 1908 Olympics, held in London, featured..."
+Generated: "Where were the 1908 Olympics held?" → this article
+```
+
+__What it enables:__
+Standard retrieval evaluation in the BEIR/MSMARCO format, but over Wikipedia's full breadth.
+Cost: ~12 hours on one H100 for 6.6M English articles with a 3B model.
+
+### 8. Infobox structured data (parsed)
+
+FineWiki extracts infoboxes as structured JSON:
+
+```json
+[{"title": "1907–08 British Home Championship",
+  "data": {"Host country": "England, Ireland, Scotland and Wales",
+           "Dates": "15 February – 11 April 1908",
+           "Teams": "4"}},
+ {"title": "Tournament statistics",
+  "data": {"Top scorer(s)": "Vivian Woodward · Jimmy Quinn (4 goals)"}}]
+```
+
+Each key-value pair is a structured fact that can be turned into a query:
+"Who was the top scorer of the 1907–08 British Home Championship?" → this article.
+
+__What it enables:__
+Structured knowledge retrieval — queries derived from real structured data, not synthetic.
+
 ## Dataset Layout
 
 Layout mirrors [FineWiki's](https://huggingface.co/datasets/HuggingFaceFW/finewiki) `data/<wiki>/<group>_<shard>.parquet` structure: one directory per Wikipedia language, with shard filenames preserved 1:1.
