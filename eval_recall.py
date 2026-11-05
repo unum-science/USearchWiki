@@ -33,12 +33,11 @@ sys.path.insert(0, str(REPO_ROOT))
 from usearchwiki import (  # noqa: E402
     CollectionShard,
     discover_collection,
-    resolve_lfs_pointer,
 )
 
 
 def memmap_shard_vectors(shard: CollectionShard, dimensions: int) -> np.ndarray:
-    blob = resolve_lfs_pointer(shard.path)
+    blob = shard.path
     return np.memmap(
         blob,
         dtype=np.float16,
@@ -105,7 +104,7 @@ def gather_ground_truth(
         gt_path = (
             model_root / shard.wikiname / f"{shard.stem}.{suffix}.ground_truth.ibin"
         )
-        gt_blob = resolve_lfs_pointer(gt_path)
+        gt_blob = gt_path
         with open(gt_blob, "rb") as file:
             rows, gt_k = struct.unpack("<II", file.read(8))
         if k > gt_k:
@@ -223,7 +222,7 @@ def main() -> None:
             flush=True,
         )
     # Read first shard header for dimensions
-    first_blob = resolve_lfs_pointer(shards[0].path)
+    first_blob = shards[0].path
     with open(first_blob, "rb") as file:
         _, dimensions = struct.unpack("<II", file.read(8))
     print(f"  {total_vectors:,} vectors x {dimensions}d", flush=True)

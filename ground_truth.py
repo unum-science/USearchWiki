@@ -49,7 +49,6 @@ from retrievers import (  # noqa: E402
 from usearchwiki import (  # noqa: E402
     CollectionShard,
     discover_collection,
-    resolve_lfs_pointer,
     write_bin,
 )
 
@@ -65,7 +64,7 @@ def load_dense_collection(
     started = time.monotonic()
     for shard in shards:
         path = model_root / shard.wikiname / f"{shard.stem}.{suffix}.f16bin"
-        blob_path = resolve_lfs_pointer(path)
+        blob_path = path
         with open(blob_path, "rb") as file:
             header = file.read(8)
             rows, columns = struct.unpack("<II", header)
@@ -248,7 +247,7 @@ def run_dense(args, model_root: Path) -> None:
     )
 
     # Read dimensions from the first shard's header.
-    first_blob = resolve_lfs_pointer(shards[0].path)
+    first_blob = shards[0].path
     with open(first_blob, "rb") as file:
         _, dimensions = struct.unpack("<II", file.read(8))
     if args.dimensions and args.dimensions != dimensions:

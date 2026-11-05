@@ -30,7 +30,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from usearchwiki import (  # noqa: E402
     CollectionShard,
     discover_collection,
-    resolve_lfs_pointer,
 )
 
 
@@ -47,7 +46,7 @@ def memmap_shard(
     in FP32 before being cast back to FP16 — the standard Matryoshka
     truncation recipe.
     """
-    blob = resolve_lfs_pointer(shard.path)
+    blob = shard.path
     full = np.memmap(
         blob,
         dtype=np.float16,
@@ -330,7 +329,7 @@ def main() -> None:
     shards = discover_collection(model_root, args.output_suffix)
     if not shards:
         raise SystemExit(f"no .{args.output_suffix}.f16bin shards under {model_root}")
-    first_blob = resolve_lfs_pointer(shards[0].path)
+    first_blob = shards[0].path
     with open(first_blob, "rb") as file:
         _, dimensions = struct.unpack("<II", file.read(8))
     total_vectors = sum(s.row_count for s in shards)

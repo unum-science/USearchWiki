@@ -206,7 +206,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# WikiVerse-specific: deprecated (binary files now tracked via Git LFS)
+# Local outputs of the provenance scripts; the published files live in the bucket
+gte-moderncolbert-v1/
+qwen3-embedding-0.6b/
+nomic-embed-text-v1.5/
+snowflake-arctic-embed-l-v2.0/
 data/*
 !data/README.md
 state/

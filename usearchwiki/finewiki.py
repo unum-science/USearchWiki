@@ -19,7 +19,6 @@ file_extensions = {"f16": "f16bin", "f32": "fbin", "i32": "ibin"}
 
 DType = Literal["f16", "f32", "i32"]
 
-LFS_POINTER_PREFIX = b"version https://git-lfs"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,44 +47,6 @@ class CollectionShard:
     row_count: int
 
 
-def resolve_lfs_pointer(path: Path) -> Path:
-    """If `path` is a Git-LFS pointer file, return the materialized blob in
-    `.git/lfs/objects`; otherwise return the path unchanged.
-
-    Pointer files are tiny ASCII stubs (~133 bytes) with an `oid sha256:<hex>`
-    line. Repositories cloned with `GIT_LFS_SKIP_SMUDGE=1` (or with `git lfs
-    fetch` only) keep the actual binaries under `.git/lfs/objects/<aa>/<bb>/<oid>`
-    while the working tree holds pointers. Reading those blobs in place avoids
-    checking out a duplicate copy of the dataset.
-    """
-    try:
-        if path.stat().st_size > 1024:
-            return path
-    except OSError:
-        return path
-    with open(path, "rb") as file:
-        head = file.read(256)
-    if not head.startswith(LFS_POINTER_PREFIX):
-        return path
-    oid: str | None = None
-    for line in head.decode("ascii", errors="ignore").splitlines():
-        if line.startswith("oid sha256:"):
-            oid = line.split(":", 1)[1].strip()
-            break
-    if not oid:
-        raise ValueError(f"{path}: looks like an LFS pointer but no sha256 oid line")
-    # Walk parents of the resolved path so symlinked working trees still find
-    # the original repo's `.git/lfs/objects`.
-    for ancestor in path.resolve().parents:
-        candidate = ancestor / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"{path}: LFS pointer references oid {oid} but no .git/lfs/objects/ contains it; "
-        f"run `git lfs fetch` or pass --output to a tree that has the blobs"
-    )
-
-
 def discover_collection(
     model_root: Path, suffix: str = "body"
 ) -> list[CollectionShard]:
@@ -108,7 +69,7 @@ def discover_collection(
             continue
         for path in sorted(wiki_dir.glob(f"*.{suffix}.f16bin")):
             stem = path.name[: -len(f".{suffix}.f16bin")]
-            blob = resolve_lfs_pointer(path)
+            blob = path
             with open(blob, "rb") as file:
                 rows, _columns = struct.unpack("<II", file.read(8))
             shards.append(

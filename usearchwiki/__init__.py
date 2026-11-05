@@ -11,7 +11,6 @@ from usearchwiki.finewiki import (
     load_lang,
     load_shard_texts,
     read_bin,
-    resolve_lfs_pointer,
     shard_filename,
     write_bin,
 )
@@ -31,7 +30,6 @@ __all__ = [
     "load_lang",
     "load_shard_texts",
     "read_bin",
-    "resolve_lfs_pointer",
     "shard_filename",
     "write_bin",
 ]

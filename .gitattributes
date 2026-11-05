@@ -1,3 +1,0 @@
-*.f16bin filter=lfs diff=lfs merge=lfs -text
-*.ibin filter=lfs diff=lfs merge=lfs -text
-*.fbin filter=lfs diff=lfs merge=lfs -text

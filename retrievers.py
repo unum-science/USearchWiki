@@ -31,7 +31,6 @@ import numpy as np
 from usearchwiki import (
     CollectionShard,
     discover_collection,
-    resolve_lfs_pointer,
 )
 
 
@@ -39,7 +38,7 @@ from usearchwiki import (
 
 
 def _read_header(path: Path) -> tuple[int, int]:
-    blob = resolve_lfs_pointer(path)
+    blob = path
     with open(blob, "rb") as file:
         rows, columns = struct.unpack("<II", file.read(8))
     return rows, columns
@@ -427,7 +426,7 @@ def load_dense_corpus(
     total = sum(shard.row_count for shard in shards)
     embeddings = np.empty((total, dimensions), dtype=np.float16)
     for shard in shards:
-        blob = resolve_lfs_pointer(shard.path)
+        blob = shard.path
         with open(blob, "rb") as file:
             file.seek(8)
             destination = embeddings[
@@ -1011,7 +1010,7 @@ def load_maxsim_corpus(
             offsets_path = wiki_dir / f"{stem}.{suffix}.sections.offsets.ibin"
             if not offsets_path.is_file():
                 raise FileNotFoundError(f"missing offsets file: {offsets_path}")
-            offsets_blob = resolve_lfs_pointer(offsets_path)
+            offsets_blob = offsets_path
             with open(offsets_blob, "rb") as file:
                 rows, _cols = struct.unpack("<II", file.read(8))
                 local_offsets = np.frombuffer(
@@ -1041,7 +1040,7 @@ def load_maxsim_corpus(
 
     token_bank = np.empty((cumulative_tokens, dimensions), dtype=np.float16)
     for token_offset, token_count, path in token_chunks:
-        blob = resolve_lfs_pointer(path)
+        blob = path
         with open(blob, "rb") as file:
             file.seek(8)
             destination = token_bank[token_offset : token_offset + token_count]
