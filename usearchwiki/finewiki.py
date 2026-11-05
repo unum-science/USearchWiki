@@ -1,4 +1,4 @@
-"""WikiVerse: embeddings for FineWiki articles and titles."""
+"""FineWiki source shards and the `.f16bin` files the embedding and ground-truth scripts wrote over them."""
 
 from __future__ import annotations
 

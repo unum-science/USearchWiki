@@ -1,7 +1,7 @@
 [project]
 name = "usearchwiki"
-version = "0.0.0"
-description = "Multi-model embedding dataset over FineWiki for ANN-search benchmarking"
+version = "3.0.0"
+description = "Open, searchable atlas of wiki-style and scholarly text: sections, links, dates, places, embeddings and search graphs"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
@@ -15,7 +15,11 @@ dense    = ["httpx>=0.27"]
 ground   = ["cupy-cuda12x>=14", "torch>=2.5"]
 colbert  = ["pylate>=1.0"]
 index    = ["usearch>=2.25"]
+search   = ["usearch>=3"]
 dev      = ["ruff>=0.15", "pytest>=8", "mypy>=1.13"]
+
+[tool.setuptools]
+packages = ["usearchwiki"]
 
 [tool.ruff]
 line-length = 100

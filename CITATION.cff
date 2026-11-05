@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+title: "USearchWiki: An Open, Searchable Atlas of Wiki-Style and Scholarly Text"
+message: "If you use this dataset, please cite it as below."
+type: dataset
+license: Apache-2.0
+version: 3.0.0
+repository-code: https://github.com/unum-cloud/USearchWiki
+doi: 10.5281/zenodo.23977284
+abstract: >-
+  An open, searchable atlas of wiki-style and scholarly text, including Wikipedia in every
+  language and the arXiv, bioRxiv and medRxiv preprint servers under each paper's own license.
+  Every document is one Parquet row under a permanent key, with its sections, original markup
+  and rendered text inside it, while embeddings from several models, links resolved to
+  cross-language Wikidata entities and the dates and places each passage mentions are added
+  beside the same rows, together with USearch graphs that search documents and sections,
+  including late-interaction MaxSim. It is distributed as row-aligned Parquet shards with one
+  file per embedding model and graph files on AWS S3, for researchers, retrieval pipelines and
+  agents that search text across languages and disciplines.
+keywords:
+  - wikipedia
+  - scholarly literature
+  - information retrieval
+  - semantic search
+  - multilingual embeddings
+  - entity linking
+  - vector search
+  - open data
+
+authors:
+  - family-names: Vardanian
+    given-names: Ash
+    alias: ashvardanian
+    email: ash.vardanian@unum.cloud
+    website: https://ashvardanian.com
+    orcid: https://orcid.org/0000-0002-4882-1815
+
+references:
+  - type: data
+    title: "FineWiki"
+    url: https://huggingface.co/datasets/HuggingFaceFW/finewiki
+    authors:
+      - name: Hugging Face
+  - type: software
+    title: "USearch: Smaller & Faster Similarity Search & Clustering Engine"
+    url: https://github.com/unum-cloud/USearch
+    doi: 10.5281/zenodo.7949415
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+        orcid: https://orcid.org/0000-0002-4882-1815

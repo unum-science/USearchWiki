@@ -207,7 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 # WikiVerse-specific: deprecated (binary files now tracked via Git LFS)
-data/
+data/*
+!data/README.md
 state/
 benchmarks/results/
 logs/
