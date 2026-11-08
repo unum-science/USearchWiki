@@ -3,7 +3,6 @@ title: "USearchWiki: An Open, Searchable Atlas of Wiki-Style and Scholarly Text"
 message: "If you use this dataset, please cite it as below."
 type: dataset
 license: Apache-2.0
-version: 3.0.0
 repository-code: https://github.com/unum-cloud/USearchWiki
 doi: 10.5281/zenodo.23977284
 abstract: >-
@@ -30,8 +29,6 @@ authors:
   - family-names: Vardanian
     given-names: Ash
     alias: ashvardanian
-    email: ash.vardanian@unum.cloud
-    website: https://ashvardanian.com
     orcid: https://orcid.org/0000-0002-4882-1815
 
 references:
@@ -41,7 +38,7 @@ references:
     authors:
       - name: Hugging Face
   - type: software
-    title: "USearch: Smaller & Faster Similarity Search & Clustering Engine"
+    title: "USearch: One Proximity Graph for Search, Sparse Products and Attention, across RAM, VRAM and NVMe"
     url: https://github.com/unum-cloud/USearch
     doi: 10.5281/zenodo.7949415
     authors:

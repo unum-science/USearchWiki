@@ -3,8 +3,15 @@ name = "usearchwiki"
 version = "3.0.0"
 description = "Open, searchable atlas of wiki-style and scholarly text: sections, links, dates, places, embeddings and search graphs"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+]
 dependencies = [
     "numpy>=1.26",
     "pyarrow>=16",
